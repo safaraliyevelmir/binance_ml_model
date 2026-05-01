@@ -201,6 +201,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
     # ── 3. Daily vol on full bars (EWM is causal — no leakage) ──
     close_ts = pd.Series(bars["close"].values, index=pd.DatetimeIndex(bars["close_time"]))
     vol_full = getDailyVol(close_ts, span=span)
+    vol_full = vol_full[~vol_full.index.duplicated(keep="last")]
 
     # ── 4. CUSUM filter — select which bars to label (after features are computed) ──
     if use_cusum:
@@ -356,6 +357,7 @@ def evaluate_on_test(best_trial: optuna.Trial, log: logging.Logger) -> None:
         index=pd.DatetimeIndex(bars_full["close_time"]),
     )
     vol_full = getDailyVol(close_ts_full, span=span)
+    vol_full = vol_full[~vol_full.index.duplicated(keep="last")]
 
     # CUSUM on FULL series so the filter state carries history from trainval
     if use_cusum:
