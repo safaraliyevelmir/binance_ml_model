@@ -47,9 +47,21 @@ def t1_positions(clean: pd.DataFrame) -> np.ndarray:
     return np.clip(pos, np.arange(len(clean)), len(clean) - 1)
 
 
-def build_sample_weights(ret: pd.Series, avg_u: np.ndarray) -> np.ndarray:
-    # AFML Eq 4.10: w_i = ū_i × |ret_i|, then normalised to sum to N
+def time_decay_weights(n: int, c: float = 1.0) -> np.ndarray:
+    # AFML Ch.4.5: linear ramp from c (oldest) to 1.0 (newest), clipped at 0.
+    # c=1 → flat (no decay); c=0 → 0..1; c<0 → oldest observations zeroed.
+    return np.maximum(np.linspace(c, 1.0, n), 0.0)
+
+
+def build_sample_weights(
+    ret: pd.Series,
+    avg_u: np.ndarray,
+    decay: np.ndarray | None = None,
+) -> np.ndarray:
+    # AFML Eq 4.10 + Ch.4.5: w_i = decay_i × ū_i × |ret_i|, normalised to N
     w = avg_u * ret.abs().to_numpy(dtype=np.float64)
+    if decay is not None:
+        w = w * decay
     total = w.sum()
     if total == 0:
         return np.ones(len(ret), dtype=np.float64)
@@ -63,6 +75,7 @@ def run_cv(
     max_hold: int = MAX_HOLD,
     rf_params: dict | None = None,
     feature_cols: list | None = None,
+    time_decay_c: float = 0.67,
 ) -> tuple[list, pd.DataFrame, list[dict]]:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
     # Always include log_return in clean (needed for strategy return computation)
@@ -84,7 +97,8 @@ def run_cv(
         # sample weights from training fold only
         train_clean = clean.iloc[train_idx]
         avg_u_tr = get_avg_uniqueness(len(train_clean), max_hold, t1_indices=t1_positions(train_clean))
-        w_tr = build_sample_weights(train_clean[WEIGHT_COL], avg_u_tr)
+        decay_tr = time_decay_weights(len(train_clean), c=time_decay_c)
+        w_tr = build_sample_weights(train_clean[WEIGHT_COL], avg_u_tr, decay=decay_tr)
 
         # frac_diff d selected on training close prices, causal transform applied to full series
         best_d, _ = find_min_d(clean["close"].iloc[train_idx])
@@ -147,13 +161,15 @@ def train_final(
     max_hold: int = MAX_HOLD,
     feature_cols: list | None = None,
     out_path: str = MODEL_PATH,
+    time_decay_c: float = 1.0,
 ) -> RandomForestClassifier:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
     extra = [c for c in [TARGET_COL, WEIGHT_COL, "close_time", "t1_time"] if c not in fc]
     clean = df[list(fc) + extra].dropna()
     X, y = clean[list(fc)], clean[TARGET_COL]
     avg_u = get_avg_uniqueness(len(clean), max_hold, t1_indices=t1_positions(clean))
-    weights = build_sample_weights(clean[WEIGHT_COL], avg_u)
+    decay = time_decay_weights(len(clean), c=time_decay_c) if time_decay_c != 1.0 else None
+    weights = build_sample_weights(clean[WEIGHT_COL], avg_u, decay=decay)
     model = RandomForestClassifier(**rf_params)
     model.fit(X, y, sample_weight=weights)
     joblib.dump(model, out_path)

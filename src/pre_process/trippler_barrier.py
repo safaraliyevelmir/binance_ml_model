@@ -12,7 +12,8 @@ RAW_DIR  = "data/raw"
 OUT_PATH = f"data/processed/labels_{SYMBOL}.parquet"
 
 PT_SL = [1.2, 1]
-SPAN = 100
+
+ = 100
 MAX_HOLD = 400
 
 def getDailyVol(close: pd.Series, span: int = 100):
