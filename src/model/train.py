@@ -80,6 +80,8 @@ def run_cv(
     rf_params: dict | None = None,
     feature_cols: list | None = None,
     time_decay_c: float = 0.67,
+    use_time_decay: bool = False,
+    use_overlap: bool = False,
 ) -> tuple[list, pd.DataFrame, list[dict]]:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
     # Always include log_return in clean (needed for strategy return computation)
@@ -99,10 +101,7 @@ def run_cv(
 
     for fold_i, (train_idx, test_idx) in enumerate(cv.split(clean)):
         # sample weights from training fold only
-        train_clean = clean.iloc[train_idx]
-        avg_u_tr = get_avg_uniqueness(len(train_clean), max_hold, t1_indices=t1_positions(train_clean))
-        decay_tr = time_decay_weights(len(train_clean), c=time_decay_c)
-        w_tr = build_sample_weights(train_clean[WEIGHT_COL], avg_u_tr, decay=decay_tr)
+
 
         # frac_diff d selected on training close prices, causal transform applied to full series
         best_d, _ = find_min_d(clean["close"].iloc[train_idx])
@@ -115,9 +114,15 @@ def run_cv(
             X_te["frac_diff"] = fd.iloc[test_idx].values
 
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-
         model = RandomForestClassifier(**rf_params)
-        model.fit(X_tr, y_tr, sample_weight=w_tr)
+        if use_time_decay or use_overlap:
+            train_clean = clean.iloc[train_idx]
+            avg_u_tr = get_avg_uniqueness(len(train_clean), max_hold, t1_indices=t1_positions(train_clean))
+            decay_tr = time_decay_weights(len(train_clean), c=time_decay_c)
+            w_tr = build_sample_weights(train_clean[WEIGHT_COL], avg_u_tr, decay=decay_tr)
+            model.fit(X_tr, y_tr, sample_weight=w_tr)
+        else:
+            model.fit(X_tr, y_tr)
 
         y_pred = model.predict(X_te)
         y_proba = model.predict_proba(X_te)

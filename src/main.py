@@ -264,6 +264,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
         max_hold=max_hold,
         rf_params=rf_params,
         feature_cols=OPTUNA_FEATURE_COLS,
+        use_time_decay=use_time_decay,
+        use_overlap=use_overlap,
     )
 
     # Per-fold log
