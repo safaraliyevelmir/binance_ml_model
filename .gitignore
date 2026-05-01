@@ -14,3 +14,4 @@ logs/
 mlruns/
 *.md
 *.ipynb
+.DS_Store

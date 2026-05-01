@@ -273,7 +273,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
     t2 = time.perf_counter()
     df = build_features_inline(bars, labels_df)
     df["t1"] = df["t1_time"]
-    log.debug(f"Features: {len(df):,} rows  [{time.perf_counter()-t2:.1f}s]")
+    log.debug(f"Features: {len(df):,} rows [{time.perf_counter()-t2:.1f}s]")
 
     # ── Long-only binary labels: drop hold(0), remap short(-1)→0 ──
     df = df[df["label"] != 0].copy()
@@ -306,18 +306,18 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
         zero_division=0,
     )
     macro_f1 = safe(oos_report["macro avg"]["f1-score"])
-    accuracy  = safe(oos_report["accuracy"])
-    f1_long   = safe(oos_report["long"]["f1-score"])
-    f1_flat   = safe(oos_report["flat"]["f1-score"])
+    accuracy = safe(oos_report["accuracy"])
+    f1_long = safe(oos_report["long"]["f1-score"])
+    f1_flat = safe(oos_report["flat"]["f1-score"])
 
     # Store as Optuna user attrs so they appear in trials_dataframe()
-    trial.set_user_attr("oos_sharpe",    oos_sharpe)
-    trial.set_user_attr("oos_f1_macro",  macro_f1)
-    trial.set_user_attr("oos_accuracy",  accuracy)
-    trial.set_user_attr("oos_f1_long",   f1_long)
-    trial.set_user_attr("oos_f1_flat",   f1_flat)
-    trial.set_user_attr("max_hold",      max_hold)
-    trial.set_user_attr("n_bars",        len(df))
+    trial.set_user_attr("oos_sharpe", oos_sharpe)
+    trial.set_user_attr("oos_f1_macro", macro_f1)
+    trial.set_user_attr("oos_accuracy", accuracy)
+    trial.set_user_attr("oos_f1_long", f1_long)
+    trial.set_user_attr("oos_f1_flat", f1_flat)
+    trial.set_user_attr("max_hold", max_hold)
+    trial.set_user_attr("n_bars", len(df))
 
     # ── Save model (task req 8: all models saved) ──
     t4 = time.perf_counter()
@@ -329,7 +329,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
         feature_cols=OPTUNA_FEATURE_COLS,
         out_path=model_path,
     )
-    log.debug(f"  model saved → {model_path}  [{time.perf_counter()-t4:.1f}s]")
+    log.debug(f"Model saved → {model_path}  [{time.perf_counter()-t4:.1f}s]")
 
     wall = time.perf_counter() - t_trial
     log.info(
