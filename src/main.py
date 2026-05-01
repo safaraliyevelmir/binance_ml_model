@@ -405,9 +405,11 @@ def evaluate_on_test(best_trial: optuna.Trial, log: logging.Logger) -> None:
         output_dict=True,
         zero_division=0,
     )
+    # Use next bar's return — consistent with run_cv which uses log_return.shift(-1)
+    next_ret = df_test["log_return"].shift(-1)
     strat_ret = strategy_log_returns(
         y_pred,
-        df_test.loc[X_test.index, "log_return"].to_numpy(),
+        next_ret.loc[X_test.index].to_numpy(),
     )
     test_sharpe = safe(sharpe_ratio(strat_ret))
 
