@@ -1,0 +1,28 @@
+[project]
+name = "binance-ml-model"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "aiohttp>=3.13.5",
+    "matplotlib>=3.10.8",
+    "mlflow==3.11.1",
+    "mplfinance>=0.12.10b0",
+    "numba>=0.61.2",
+    "optuna>=4.8.0",
+    "pandas>=3.0.2",
+    "pandas-ta",
+    "pyarrow>=23.0.1",
+    "requests>=2.33.1",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "statsmodels>=0.14.6",
+]
+
+[tool.uv]
+environments = ["sys_platform == 'darwin'"]
+override-dependencies = [
+    "pandas>=3.0.2",
+    "pyarrow>=23.0.1",
+]
