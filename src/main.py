@@ -68,6 +68,8 @@ SEARCH_SPACE: dict[str, list] = {
     "span":          list(range(10, 101, 10)),    # task req 3
     "max_hold_slot": [0, 1, 2, 3, 4],            # task req 4
     "use_cusum":     [True, False],              # task req 5
+    "use_time_decay": [True, False],            # additional decay ablation
+    "use_overlap": [True, False],               # additional overlap ablation
 }
 
 N_TRIALS: int = (
@@ -76,7 +78,9 @@ N_TRIALS: int = (
     * len(SEARCH_SPACE["span"])
     * len(SEARCH_SPACE["max_hold_slot"])
     * len(SEARCH_SPACE["use_cusum"])
-)  # 6 × 2 × 10 × 5 × 2 = 1,200
+    * len(SEARCH_SPACE["use_time_decay"])
+    * len(SEARCH_SPACE["use_overlap"])
+)  # 6 × 2 × 10 × 5 × 2 × 2 × 2 = 4800
 
 STUDY_NAME = "dollar_bar_gridsearch"
 
@@ -176,6 +180,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
     span          = trial.suggest_int("span",          10, 100, step=10)
     max_hold_slot = trial.suggest_int("max_hold_slot",  0,   4)
     use_cusum     = trial.suggest_categorical("use_cusum",     SEARCH_SPACE["use_cusum"])
+    use_time_decay = trial.suggest_categorical("use_time_decay", SEARCH_SPACE["use_time_decay"])
+    use_overlap = trial.suggest_categorical("use_overlap", SEARCH_SPACE["use_overlap"])
 
     low, high, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
@@ -184,6 +190,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
     log.debug(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={pt_sl_key}"
         f"  span={span}  hold={max_hold}  cusum={use_cusum}"
+        f"  time_decay={use_time_decay}  overlap={use_overlap}"
     )
 
     # ── 1. Load bars — slice to train/val; test set is never touched during Optuna ──
@@ -320,6 +327,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict | None =
         max_hold=max_hold,
         feature_cols=OPTUNA_FEATURE_COLS,
         out_path=model_path,
+        use_time_decay=use_time_decay,
+        use_overlap=use_overlap
     )
     log.debug(f"  model saved → {model_path}  [{time.perf_counter()-t_save:.1f}s]")
 

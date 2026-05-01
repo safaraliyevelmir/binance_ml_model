@@ -57,11 +57,15 @@ def build_sample_weights(
     ret: pd.Series,
     avg_u: np.ndarray,
     decay: np.ndarray | None = None,
+    use_time_decay: bool = False,
+    use_overlap: bool = False
 ) -> np.ndarray:
     # AFML Eq 4.10 + Ch.4.5: w_i = decay_i × ū_i × |ret_i|, normalised to N
-    w = avg_u * ret.abs().to_numpy(dtype=np.float64)
-    if decay is not None:
-        w = w * decay
+    if use_overlap:
+        w = avg_u * ret.abs().to_numpy(dtype=np.float64)
+    if use_time_decay:
+        if decay is not None:
+            w = w * decay
     total = w.sum()
     if total == 0:
         return np.ones(len(ret), dtype=np.float64)
@@ -162,16 +166,21 @@ def train_final(
     feature_cols: list | None = None,
     out_path: str = MODEL_PATH,
     time_decay_c: float = 1.0,
+    use_time_decay: bool = False,
+    use_overlap: bool = False,
 ) -> RandomForestClassifier:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
     extra = [c for c in [TARGET_COL, WEIGHT_COL, "close_time", "t1_time"] if c not in fc]
     clean = df[list(fc) + extra].dropna()
     X, y = clean[list(fc)], clean[TARGET_COL]
-    avg_u = get_avg_uniqueness(len(clean), max_hold, t1_indices=t1_positions(clean))
-    decay = time_decay_weights(len(clean), c=time_decay_c) if time_decay_c != 1.0 else None
-    weights = build_sample_weights(clean[WEIGHT_COL], avg_u, decay=decay)
     model = RandomForestClassifier(**rf_params)
-    model.fit(X, y, sample_weight=weights)
+    if use_overlap or use_time_decay:
+        avg_u = get_avg_uniqueness(len(clean), max_hold, t1_indices=t1_positions(clean))
+        decay = time_decay_weights(len(clean), c=time_decay_c) if time_decay_c != 1.0 else None
+        weights = build_sample_weights(clean[WEIGHT_COL], avg_u, decay=decay, use_time_decay=use_time_decay, use_overlap=use_overlap)
+        model.fit(X, y, sample_weight=weights)
+    else:
+        model.fit(X, y)
     joblib.dump(model, out_path)
     return model
 
