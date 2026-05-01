@@ -481,7 +481,7 @@ def optuna_main(
     log.info(f"Best trial #{best.number}  |  OOS Sharpe = {best.value:.4f}")
     log.info(f"  Params  : {best.params}")
     log.info(f"  Metrics : {best.user_attrs}")
-    out_csv = "data/processed/optuna_trials.csv"
+    out_csv = "optuna_trials.csv"
     study.trials_dataframe().to_csv(out_csv, index=False)
     log.info(f"Trial history → {out_csv}  ({len(study.trials)} rows)")
     log.info("=" * 72)
