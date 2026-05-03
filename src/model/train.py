@@ -61,11 +61,9 @@ def build_sample_weights(
     use_overlap: bool = False
 ) -> np.ndarray:
     # AFML Eq 4.10 + Ch.4.5: w_i = decay_i × ū_i × |ret_i|, normalised to N
-    if use_overlap:
-        w = avg_u * ret.abs().to_numpy(dtype=np.float64)
-    if use_time_decay:
-        if decay is not None:
-            w = w * decay
+    w = avg_u * ret.abs().to_numpy(dtype=np.float64) if use_overlap else ret.abs().to_numpy(dtype=np.float64)
+    if use_time_decay and decay is not None:
+        w = w * decay
     total = w.sum()
     if total == 0:
         return np.ones(len(ret), dtype=np.float64)
