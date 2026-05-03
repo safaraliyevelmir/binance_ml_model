@@ -441,14 +441,23 @@ def optuna_main(
     n_trials: int = N_TRIALS,
     study_name: str = STUDY_NAME,
     optuna_n_jobs: int = 1,
+    rf_n_jobs: int | None = None,
+    storage: str | None = None,
 ) -> None:
     import os
+    # Pin BLAS/OpenBLAS/MKL to 1 thread to prevent over-subscription when
+    # RF's joblib workers each spawn their own BLAS threads.
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
     run_name = f"optuna_{study_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     log = setup_logging(run_name)
 
     cpu_count = os.cpu_count() or 1
-    rf_jobs_per_worker = max(1, cpu_count // max(1, optuna_n_jobs))
-    rf_params_runtime = {**FIXED_RF_PARAMS, "n_jobs": rf_jobs_per_worker}
+    if rf_n_jobs is None:
+        rf_n_jobs = max(1, cpu_count // max(1, optuna_n_jobs))
+    rf_params_runtime = {**FIXED_RF_PARAMS, "n_jobs": rf_n_jobs}
 
     log.info("=" * 72)
     log.info(f"Optuna Grid Search  —  {SYMBOL}")
@@ -462,8 +471,9 @@ def optuna_main(
     )
     log.info(
         f"Parallel: optuna_n_jobs={optuna_n_jobs}"
-        f"  rf_jobs_per_worker={rf_jobs_per_worker}"
+        f"  rf_n_jobs={rf_n_jobs}"
         f"  cpu_count={cpu_count}"
+        f"  storage={storage or 'in-memory'}"
     )
     log.info("=" * 72)
 
@@ -473,6 +483,8 @@ def optuna_main(
         direction="maximize",
         study_name=study_name,
         sampler=optuna.samplers.GridSampler(SEARCH_SPACE),
+        storage=storage,
+        load_if_exists=True,
     )
 
     flow_start = time.perf_counter()
@@ -501,4 +513,21 @@ def optuna_main(
 
 
 if __name__ == "__main__":
-    optuna_main()
+    import argparse
+    parser = argparse.ArgumentParser(description="Optuna grid search")
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="Parallel Optuna trials (use 1 with --multiprocess)")
+    parser.add_argument("--rf-jobs", type=int, default=None,
+                        help="RF cores per worker (default: cpu_count // n-jobs)")
+    parser.add_argument("--n-trials", type=int, default=N_TRIALS)
+    parser.add_argument("--study-name", type=str, default=STUDY_NAME)
+    parser.add_argument("--storage", type=str, default=None,
+                        help="e.g. sqlite:///optuna.db  (required for --multiprocess)")
+    args = parser.parse_args()
+    optuna_main(
+        n_trials=args.n_trials,
+        study_name=args.study_name,
+        optuna_n_jobs=args.n_jobs,
+        rf_n_jobs=args.rf_jobs,
+        storage=args.storage,
+    )
