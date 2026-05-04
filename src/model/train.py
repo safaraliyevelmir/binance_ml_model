@@ -22,20 +22,20 @@ FEATURE_COLS  = [
     "adx", "adx_pdi", "adx_mdi",
     "stoch_rsi_k", "stoch_rsi_d",
 ]
-TARGET_COL    = "label"
-WEIGHT_COL    = "ret"
+TARGET_COL = "label"
+WEIGHT_COL = "ret"
 
-MAX_HOLD      = 400
-N_SPLITS      = 5
-EMBARGO_PCT   = 0.01
-RF_PARAMS     = dict(
-    n_estimators     = 200,
-    max_features     = 1,
-    max_depth        = None,
+MAX_HOLD = 400
+N_SPLITS = 5
+EMBARGO_PCT = 0.01
+RF_PARAMS = dict(
+    n_estimators = 200,
+    max_features = 1,
+    max_depth = None,
     min_samples_leaf = 50,
-    class_weight     = "balanced",
-    n_jobs           = -1,
-    random_state     = 42,
+    class_weight = "balanced",
+    n_jobs = -1,
+    random_state = 42,
 )
 
 
@@ -82,7 +82,6 @@ def run_cv(
     use_overlap: bool = False,
 ) -> tuple[list, pd.DataFrame, list[dict]]:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
-    # Always include log_return in clean (needed for strategy return computation)
     extra = [c for c in [TARGET_COL, WEIGHT_COL, "open_time", "close_time", "t1", "t1_time", "close", "log_return"] if c not in fc]
     clean = df[list(fc) + extra].dropna()
     X = clean[list(fc)]
@@ -98,10 +97,6 @@ def run_cv(
     fold_data = []
 
     for fold_i, (train_idx, test_idx) in enumerate(cv.split(clean)):
-        # sample weights from training fold only
-
-
-        # frac_diff d selected on training close prices, causal transform applied to full series
         best_d, _ = find_min_d(clean["close"].iloc[train_idx])
         fd = frac_diff_ffd(log_px, best_d)
 

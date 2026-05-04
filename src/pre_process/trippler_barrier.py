@@ -16,7 +16,6 @@ SPAN = 100
 MAX_HOLD = 400
 
 def getDailyVol(close: pd.Series, span: int = 100):
-    # daily vol, reindexed to close
     past_pos = close.index.searchsorted(close.index - pd.Timedelta(days=1))
     past_pos = past_pos[past_pos > 0]
     curr_pos = np.arange(close.shape[0] - past_pos.shape[0], close.shape[0])
@@ -128,17 +127,15 @@ def label_bars(
         print(f"Warning: {unresolved} bars unresolved — tick data may not cover full period")
 
     out = pd.DataFrame({
-        "open_time":  bars["open_time"].values[:labelable],
+        "open_time": bars["open_time"].values[:labelable],
         "close_time": bars["close_time"].values[:labelable],
-        "close":      entry_prices,
-        "vol":        vols_arr,
-        "ofi":        bars["ofi"].values[:labelable],
-        "label":      labels,
-        "return":     log_returns,
-        "t1_time":    pd.to_datetime(resolved_times, unit="ns"),
+        "close": entry_prices,
+        "vol": vols_arr,
+        "ofi": bars["ofi"].values[:labelable],
+        "label": labels,
+        "return": log_returns,
+        "t1_time": pd.to_datetime(resolved_times, unit="ns"),
     })
-    # out = out.dropna(subset=["vol", "return"])
-    # out = out[out["label"] != 0].reset_index(drop=True)
     return out
 
 
@@ -148,7 +145,6 @@ if __name__ == "__main__":
     print(f"  {len(bars):,} bars")
 
     print(f"Computing daily volatility (span={SPAN})…")
-    # getDailyVol needs a DatetimeIndex — use close_time, not the default RangeIndex
     close_ts = bars["close"].copy()
     close_ts.index = pd.to_datetime(bars.close_time)
     vol = getDailyVol(close_ts, span=SPAN)
