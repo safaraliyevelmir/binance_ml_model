@@ -13,12 +13,20 @@ def strategy_log_returns(
     return pd.Series(y_pred.astype(float) * bar_ret, name="strategy_ret")
 
 
-def sharpe_ratio(strat_ret: pd.Series, periods_per_year: int = BARS_YEAR) -> float:
-    mu  = strat_ret.mean()
+def sharpe_ratio(strat_ret: pd.Series, bars_per_year: float) -> float:
+    mu = strat_ret.mean()
     sig = strat_ret.std(ddof=1)
     if sig == 0:
         return np.nan
-    return (mu / sig) * np.sqrt(periods_per_year)
+    return (mu / sig) * np.sqrt(bars_per_year)
+
+
+
+def compute_bars_per_year(bar_timestamps: pd.Index) -> float:
+    duration = bar_timestamps[-1] - bar_timestamps[0]
+    seconds = duration.total_seconds()
+    duration_years = seconds / (365.25 * 24 * 3600)
+    return len(bar_timestamps) / duration_years
 
 
 def max_drawdown(strat_ret: pd.Series) -> float:
@@ -106,17 +114,3 @@ def plot_equity_curve(strat_ret: pd.Series, title: str = "Strategy Equity Curve"
     plt.tight_layout()
     plt.savefig("data/processed/equity_curve_SOLUSDT.png", dpi=150)
     plt.close()
-
-
-if __name__ == "__main__":
-    oos = pd.read_parquet("data/processed/oos_preds_SOLUSDT.parquet")
-    print(f"OOS predictions:")
-
-    metrics = full_report(
-        y_true  = oos["y_true"].to_numpy(),
-        y_pred  = oos["y_pred"].to_numpy(),
-        bar_ret = oos["log_return"].to_numpy(),
-    )
-
-    strat_ret = strategy_log_returns(oos["y_pred"].to_numpy(), oos["log_return"].to_numpy())
-    plot_equity_curve(strat_ret)

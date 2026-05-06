@@ -2,7 +2,6 @@ import joblib
 import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report
 
 from src.features.engineer import find_min_d, frac_diff_ffd
 from src.model.purged_kfold import PurgedKFold, get_avg_uniqueness
@@ -28,16 +27,6 @@ WEIGHT_COL = "ret"
 MAX_HOLD = 400
 N_SPLITS = 5
 EMBARGO_PCT = 0.01
-RF_PARAMS = dict(
-    n_estimators = 200,
-    max_features = 1,
-    max_depth = None,
-    min_samples_leaf = 50,
-    class_weight = "balanced",
-    n_jobs = -1,
-    random_state = 42,
-)
-
 
 def t1_positions(clean: pd.DataFrame) -> np.ndarray:
     """Map each row's t1_time to its integer position within clean via searchsorted."""
@@ -82,6 +71,7 @@ def run_cv(
     use_overlap: bool = False,
 ) -> tuple[list, pd.DataFrame, list[dict]]:
     fc = feature_cols if feature_cols is not None else FEATURE_COLS
+    # Always include log_return in clean (needed for strategy return computation)
     extra = [c for c in [TARGET_COL, WEIGHT_COL, "open_time", "close_time", "t1", "t1_time", "close", "log_return"] if c not in fc]
     clean = df[list(fc) + extra].dropna()
     X = clean[list(fc)]
@@ -120,9 +110,6 @@ def run_cv(
         y_pred = model.predict(X_te)
         y_proba = model.predict_proba(X_te)
         y_train_pred = model.predict(X_tr)
-        acc = accuracy_score(y_te, y_pred)
-        print(f"Fold {fold_i}: train={len(X_tr):,}  test={len(X_te):,}  acc={acc:.4f}")
-        print(classification_report(y_te, y_pred, zero_division=0))
 
         fold_data.append({
             "fold": fold_i,
@@ -133,6 +120,7 @@ def run_cv(
             "bar_ret": next_ret.iloc[test_idx].to_numpy(),
             "y_train_true": y_tr.to_numpy(),
             "y_train_pred": y_train_pred,
+            "timestamps": clean["close_time"].iloc[test_idx].to_numpy(),
         })
 
         cls_names = [f"proba_{int(c)}" for c in model.classes_]
@@ -151,7 +139,7 @@ def run_cv(
         pd.DataFrame(oos_records)
         .set_index("idx")
         .sort_index()
-        .join(clean[[WEIGHT_COL]].rename(columns={WEIGHT_COL: "ret"}))
+        .join(clean[[WEIGHT_COL, "close_time"]].rename(columns={WEIGHT_COL: "ret"}))
         .join(next_ret.to_frame("log_return"))
     )
     return fold_models, oos_df, fold_data
@@ -181,25 +169,3 @@ def train_final(
         model.fit(X, y)
     joblib.dump(model, out_path)
     return model
-
-
-if __name__ == "__main__":
-    df = pd.read_parquet(FEATURES_PATH)
-    df["t1"] = df["t1_time"]
-    print(f"Loaded {len(df):,} rows  |  features: {FEATURE_COLS}")
-
-    print("\n── Cross-Validation ──────────────────────────────────────────────")
-    fold_models, oos_df, _ = run_cv(df)
-
-    oos_df.to_parquet(OOS_PATH)
-    print(f"\nOOS predictions saved → {OOS_PATH}")
-
-    print("\n── Final Model ───────────────────────────────────────────────────")
-    final_model = train_final(df, RF_PARAMS)
-    print("Feature importances (MDI):")
-    for feat, imp in sorted(
-        zip(FEATURE_COLS, final_model.feature_importances_),
-        key=lambda x: x[1],
-        reverse=True,
-    ):
-        print(f"  {feat:<20} {imp:.4f}")
