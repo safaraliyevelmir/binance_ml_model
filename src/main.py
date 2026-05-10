@@ -54,12 +54,12 @@ LABELS_CACHE_DIR = Path("data/processed/labels")
 
 
 def labels_cache_path(
-    symbol: str, bar_size: int, span: int, cusum_h: float,
+    symbol: str, bar_size: int, span: int,
     pt: float, sl: float, max_hold: int,
 ) -> Path:
     return LABELS_CACHE_DIR / (
         f"labels_{symbol}_bar{bar_size}_span{span}"
-        f"_cusum{cusum_h}_pt{pt}_sl{sl}_hold{max_hold}.parquet"
+        f"_pt{pt}_sl{sl}_hold{max_hold}.parquet"
     )
 
 FIXED_RF_PARAMS: dict = {
@@ -220,39 +220,38 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     vol_full = getDailyVol(close_ts, span=span)
     vol_full = vol_full[~vol_full.index.duplicated(keep="last")]
 
-    # ── 4. CUSUM filter — select which bars to label (after features are computed) ──
-    event_times = cusum_filter(close_ts, h=cusum_h)
-    cusum_mask = bars["close_time"].isin(event_times).values
-    bars_to_label = bars[cusum_mask].reset_index(drop=True)
-    feats_to_use  = features_full[cusum_mask].reset_index(drop=True)
-    # vol: reindex to filtered bar timestamps, forward-fill any gaps
-    vol_to_label = vol_full.reindex(
-        pd.DatetimeIndex(bars_to_label["close_time"])
-    ).ffill()
-    log.debug(f"CUSUM: {len(bars_to_label):,} bars selected  [{time.perf_counter()-t0:.1f}s]")
-
-    # ── 5. Label selected bars using tick data (cached by labeling params) ──
+    # ── 4. Label ALL bars (cached by bar_size/span/max_hold; cusum applied later) ──
     t_label = time.perf_counter()
     LABELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cache_path = labels_cache_path(SYMBOL, bar_size, span, cusum_h, pt, sl, max_hold)
+    cache_path = labels_cache_path(SYMBOL, bar_size, span, pt, sl, max_hold)
     labels_cache_hit = cache_path.exists()
     if labels_cache_hit:
-        labels_df = pd.read_parquet(cache_path)
+        labels_full = pd.read_parquet(cache_path)
         cache_status = f"cache hit → {cache_path.name}"
     else:
-        labels_df = label_bars(bars_to_label, vol_to_label, pt=pt, sl=sl, max_hold=max_hold)
-        labels_df.to_parquet(cache_path, index=False)
+        vol_aligned = vol_full.reindex(pd.DatetimeIndex(bars["close_time"])).ffill()
+        labels_full = label_bars(bars, vol_aligned, pt=pt, sl=sl, max_hold=max_hold)
+        labels_full.to_parquet(cache_path, index=False)
         cache_status = f"cached → {cache_path.name}"
     log.debug(
-        f"  labels: {len(labels_df):,}"
-        f"  dist={labels_df['label'].value_counts().to_dict()}"
+        f"  labels (all bars): {len(labels_full):,}"
+        f"  dist={labels_full['label'].value_counts().to_dict()}"
         f"  ({cache_status})"
         f"  [{time.perf_counter()-t_label:.1f}s]"
     )
 
-    # ── 6. Merge features + labels (features already computed on full sequence) ──
-    labelable = len(labels_df)
-    df = feats_to_use.iloc[:labelable].copy()
+    # ── 5. CUSUM filter applied to labelable bars (positional, dedup-safe) ──
+    labelable = len(labels_full)
+    bars_labelable = bars.iloc[:labelable].reset_index(drop=True)
+    feats_labelable = features_full.iloc[:labelable].reset_index(drop=True)
+    event_times = cusum_filter(close_ts, h=cusum_h)
+    cusum_mask = bars_labelable["close_time"].isin(event_times).values
+    labels_df = labels_full[cusum_mask].reset_index(drop=True)
+    feats_to_use = feats_labelable[cusum_mask].reset_index(drop=True)
+    log.debug(f"CUSUM: {len(labels_df):,} bars selected  [{time.perf_counter()-t0:.1f}s]")
+
+    # ── 6. Merge features + labels (positional alignment, both cusum-filtered) ──
+    df = feats_to_use.copy()
     df["t1_time"] = labels_df["t1_time"].values
     df["t1"] = df["t1_time"]
     df["label"] = labels_df["label"].values
