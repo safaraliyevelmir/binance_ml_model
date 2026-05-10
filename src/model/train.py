@@ -101,8 +101,14 @@ def run_cv(
         if use_time_decay or use_overlap:
             train_clean = clean.iloc[train_idx]
             avg_u_tr = get_avg_uniqueness(len(train_clean), max_hold, t1_indices=t1_positions(train_clean))
-            decay_tr = time_decay_weights(len(train_clean), c=time_decay_c)
-            w_tr = build_sample_weights(train_clean[WEIGHT_COL], avg_u_tr, decay=decay_tr)
+            decay_tr = time_decay_weights(len(train_clean), c=time_decay_c) if use_time_decay else None
+            w_tr = build_sample_weights(
+                train_clean[WEIGHT_COL],
+                avg_u_tr,
+                decay=decay_tr,
+                use_time_decay=use_time_decay,
+                use_overlap=use_overlap,
+            )
             model.fit(X_tr, y_tr, sample_weight=w_tr)
         else:
             model.fit(X_tr, y_tr)

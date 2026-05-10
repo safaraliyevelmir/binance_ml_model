@@ -1,4 +1,3 @@
-import joblib
 import logging
 import math
 import time
@@ -27,8 +26,6 @@ from src.model.metrics import (
 from src.model.train import SYMBOL, run_cv, train_final
 from src.pre_process.trippler_barrier import getDailyVol, label_bars
 
-CUSUM_H = 0.003
-
 OPTUNA_FEATURE_COLS = [
     "frac_diff",
     "bb_pct_b", "bb_width",
@@ -49,36 +46,44 @@ MAX_HOLD_RANGES: dict[int, tuple[int, int, int]] = {
     60: (25,   125,  25),
 }
 
+FIXED_BAR_SIZE = 15
+FIXED_PT = 1.2
+FIXED_SL = 1.0
+
+LABELS_CACHE_DIR = Path("data/processed/labels")
+
+
+def labels_cache_path(
+    symbol: str, bar_size: int, span: int, cusum_h: float,
+    pt: float, sl: float, max_hold: int,
+) -> Path:
+    return LABELS_CACHE_DIR / (
+        f"labels_{symbol}_bar{bar_size}_span{span}"
+        f"_cusum{cusum_h}_pt{pt}_sl{sl}_hold{max_hold}.parquet"
+    )
+
 FIXED_RF_PARAMS: dict = {
     "n_estimators": 500,
-    "min_samples_leaf": 50,
     "class_weight": "balanced",
     "n_jobs":  -1,
     "random_state": 42,
-    "max_depth": 4
 }
 
 SEARCH_SPACE: dict[str, list] = {
-    "bar_size": [3, 5, 15, 25, 35, 50, 60],
-    "pt_sl": ["1.2_1.0", "1.0_1.0", "1.0_1.2"],
-    "span":   list(range(10, 70, 20)),
-    "max_hold_slot": [0, 1, 2, 3, 4],
-    "use_cusum":     [True],
-    "use_time_decay": [True, False],
-    "use_overlap": [True,False]
+    "span":             [10, 20, 30, 40, 50],
+    "max_hold_slot":    [0, 1, 2, 3, 4],
+    "cusum_h":          [0.002, 0.005, 0.008, 0.01, 0.015, 0.02],
+    "time_decay_c":     [-0.25, 0.0, 0.25, 0.5, 0.75, 1.0],
+    "use_overlap":      [True, False],
+    "max_depth":        [4, 5, 6, 7],
+    "min_samples_leaf": [1, 2, 4, 8, 16, 32, 64, 128],
 }
 
-N_TRIALS: int = (
-    len(SEARCH_SPACE["bar_size"])
-    * len(SEARCH_SPACE["pt_sl"])
-    * len(SEARCH_SPACE["span"])
-    * len(SEARCH_SPACE["max_hold_slot"])
-    * len(SEARCH_SPACE["use_cusum"])
-    * len(SEARCH_SPACE["use_time_decay"])
-    * len(SEARCH_SPACE["use_overlap"])
-)  # 7 × 3 × 4 × 5 × 1 × 2 × 2 = 1680
+# QMC (Sobol) budget. Sobol sequences are best at powers of 2; 512 fills the
+# lattice cleanly. Override via --n-trials if you want a different budget.
+N_TRIALS: int = 512
 
-STUDY_NAME = "dollar_bar_gridsearch"
+STUDY_NAME = "dollar_bar_15M_sobol_exp4"
 
 TEST_RATIO: float = 0.20
 
@@ -110,7 +115,7 @@ def setup_logging(run_name: str) -> logging.Logger:
     return log
 
 
-def cusum_filter(close: pd.Series, h: float = CUSUM_H) -> pd.Index:
+def cusum_filter(close: pd.Series, h: float) -> pd.Index:
     """Symmetric CUSUM filter (AFML Ch.2). close must have DatetimeIndex."""
     s_pos, s_neg = 0.0, 0.0
     events: list[object] = []
@@ -165,24 +170,39 @@ def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
 
 def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> float:
     t_trial = time.perf_counter()
-    # ── Suggest parameters ──
-    bar_size = trial.suggest_categorical("bar_size", SEARCH_SPACE["bar_size"])
-    tp_sl_key = trial.suggest_categorical("pt_sl", SEARCH_SPACE["pt_sl"])
-    span = trial.suggest_int("span", 10, 70, step=20)
-    max_hold_slot = trial.suggest_int("max_hold_slot", 0, 4)
-    use_cusum = trial.suggest_categorical("use_cusum", SEARCH_SPACE["use_cusum"])
-    use_time_decay = trial.suggest_categorical("use_time_decay", SEARCH_SPACE["use_time_decay"])
-    use_overlap = trial.suggest_categorical("use_overlap", SEARCH_SPACE["use_overlap"])
+    # ── Fixed axes for this experiment ──
+    bar_size = FIXED_BAR_SIZE
+    pt, sl = FIXED_PT, FIXED_SL
+    tp_sl_key = f"{pt}_{sl}"
 
-    low, high, step = MAX_HOLD_RANGES[bar_size]
+    # ── Suggested axes ──
+    span = trial.suggest_categorical("span", SEARCH_SPACE["span"])
+    max_hold_slot = trial.suggest_categorical("max_hold_slot", SEARCH_SPACE["max_hold_slot"])
+    cusum_h = trial.suggest_categorical("cusum_h", SEARCH_SPACE["cusum_h"])
+    time_decay_c = trial.suggest_categorical("time_decay_c", SEARCH_SPACE["time_decay_c"])
+    use_overlap = trial.suggest_categorical("use_overlap", SEARCH_SPACE["use_overlap"])
+    max_depth = trial.suggest_categorical("max_depth", SEARCH_SPACE["max_depth"])
+    min_samples_leaf = trial.suggest_categorical(
+        "min_samples_leaf", SEARCH_SPACE["min_samples_leaf"]
+    )
+
+    # AFML Eq 4.10 baseline (|ret|) is always on. c=1.0 ⇒ flat decay (no-op).
+    use_time_decay = True
+
+    trial_rf_params = {
+        **rf_params,
+        "max_depth": max_depth,
+        "min_samples_leaf": min_samples_leaf,
+    }
+
+    low, _, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
-    
-    tp_sl = tp_sl_key.split("_")
-    pt, sl = float(tp_sl[0]), float(tp_sl[1])
 
     log.debug(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
-        f" span={span}  hold={max_hold}  cusum={use_cusum}  time_decay={use_time_decay}  overlap={use_overlap}"
+        f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
+        f"  td_c={time_decay_c}  overlap={use_overlap}"
+        f"  max_depth={max_depth}  leaf={min_samples_leaf}"
     )
 
     # ── 1. Load bars — slice to train/val; test set is never touched during Optuna ──
@@ -201,7 +221,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     vol_full = vol_full[~vol_full.index.duplicated(keep="last")]
 
     # ── 4. CUSUM filter — select which bars to label (after features are computed) ──
-    event_times = cusum_filter(close_ts)
+    event_times = cusum_filter(close_ts, h=cusum_h)
     cusum_mask = bars["close_time"].isin(event_times).values
     bars_to_label = bars[cusum_mask].reset_index(drop=True)
     feats_to_use  = features_full[cusum_mask].reset_index(drop=True)
@@ -211,12 +231,22 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     ).ffill()
     log.debug(f"CUSUM: {len(bars_to_label):,} bars selected  [{time.perf_counter()-t0:.1f}s]")
 
-    # ── 5. Label selected bars using tick data ──
+    # ── 5. Label selected bars using tick data (cached by labeling params) ──
     t_label = time.perf_counter()
-    labels_df = label_bars(bars_to_label, vol_to_label, pt=pt, sl=sl, max_hold=max_hold)
+    LABELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = labels_cache_path(SYMBOL, bar_size, span, cusum_h, pt, sl, max_hold)
+    labels_cache_hit = cache_path.exists()
+    if labels_cache_hit:
+        labels_df = pd.read_parquet(cache_path)
+        cache_status = f"cache hit → {cache_path.name}"
+    else:
+        labels_df = label_bars(bars_to_label, vol_to_label, pt=pt, sl=sl, max_hold=max_hold)
+        labels_df.to_parquet(cache_path, index=False)
+        cache_status = f"cached → {cache_path.name}"
     log.debug(
         f"  labels: {len(labels_df):,}"
         f"  dist={labels_df['label'].value_counts().to_dict()}"
+        f"  ({cache_status})"
         f"  [{time.perf_counter()-t_label:.1f}s]"
     )
 
@@ -238,8 +268,9 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     _, oos_df, fold_data = run_cv(
         df,
         max_hold=max_hold,
-        rf_params=rf_params,
+        rf_params=trial_rf_params,
         feature_cols=OPTUNA_FEATURE_COLS,
+        time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
         use_overlap=use_overlap,
     )
@@ -346,25 +377,35 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     trial.set_user_attr("oos_prec_flat", prec_flat)
     trial.set_user_attr("max_hold", max_hold)
     trial.set_user_attr("n_bars", len(df))
+    trial.set_user_attr("bar_size", bar_size)
+    trial.set_user_attr("pt", pt)
+    trial.set_user_attr("sl", sl)
+    trial.set_user_attr("pt_sl", tp_sl_key)
+    trial.set_user_attr("use_cusum", True)
+    trial.set_user_attr("use_time_decay", use_time_decay)
+    trial.set_user_attr("symbol", SYMBOL)
+    trial.set_user_attr("labels_cache_hit", labels_cache_hit)
 
     # ── 10. Save model for this trial (all models saved — task req 8) ──
     t_save = time.perf_counter()
     Path("data/processed/models").mkdir(parents=True, exist_ok=True)
     model_path = f"data/processed/models/trial_{trial.number:06d}_bar{bar_size}_{SYMBOL}.pkl"
     train_final(
-        df, rf_params,
+        df, trial_rf_params,
         max_hold=max_hold,
         feature_cols=OPTUNA_FEATURE_COLS,
         out_path=model_path,
+        time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
-        use_overlap=use_overlap
+        use_overlap=use_overlap,
     )
     log.debug(f"Model saved → {model_path}  [{time.perf_counter()-t_save:.1f}s]")
 
     wall = time.perf_counter() - t_trial
     log.info(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
-        f"span={span}  hold={max_hold}  cusum={use_cusum}"
+        f" span={span}  hold={max_hold}  cusum_h={cusum_h}"
+        f"  td={use_time_decay}  td_c={time_decay_c}"
         f" | sharpe={oos_sharpe:+.4f}  f1_macro={macro_f1:.4f}"
         f"  acc={accuracy:.4f}  f1_long={f1_long:.4f}"
         f" prec_long={prec_long:.4f}  rec_long={recall_long:.4f}"
@@ -396,13 +437,26 @@ def optuna_main(
     rf_params_runtime = {**FIXED_RF_PARAMS, "n_jobs": rf_n_jobs}
 
     log.info("=" * 72)
-    log.info(f"Optuna Grid Search  —  {SYMBOL}")
-    log.info(f"Study: {study_name}  |  Trials: {n_trials:,}  |  Space: {N_TRIALS:,}")
-    log.info(f"Features ({len(OPTUNA_FEATURE_COLS)}): {OPTUNA_FEATURE_COLS}")
-    log.info(f"CUSUM h={CUSUM_H}  |  Binary long-only labels")
+    log.info(f"Optuna QMC (Sobol) Search  —  {SYMBOL}")
+    log.info(f"Study: {study_name}  |  Trials: {n_trials:,}")
     log.info(
-        f"RF (fixed): n_est={FIXED_RF_PARAMS['n_estimators']}"
-        f"  leaf={FIXED_RF_PARAMS['min_samples_leaf']}"
+        f"Fixed: bar={FIXED_BAR_SIZE}M  pt/sl={FIXED_PT}/{FIXED_SL}"
+    )
+    log.info(f"Features ({len(OPTUNA_FEATURE_COLS)}): {OPTUNA_FEATURE_COLS}")
+    log.info(
+        f"span ∈ {SEARCH_SPACE['span']}  |  "
+        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}  |  "
+        f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}"
+    )
+    log.info(
+        f"time_decay_c ∈ {SEARCH_SPACE['time_decay_c']}  |  "
+        f"use_overlap ∈ {SEARCH_SPACE['use_overlap']}  |  "
+        f"Binary long-only labels"
+    )
+    log.info(
+        f"RF: n_est={FIXED_RF_PARAMS['n_estimators']}  "
+        f"max_depth ∈ {SEARCH_SPACE['max_depth']}  "
+        f"min_samples_leaf ∈ {SEARCH_SPACE['min_samples_leaf']}"
     )
     log.info(
         f"Parallel: optuna_n_jobs={optuna_n_jobs}"
@@ -417,7 +471,7 @@ def optuna_main(
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
-        sampler=optuna.samplers.GridSampler(SEARCH_SPACE),
+        sampler=optuna.samplers.QMCSampler(qmc_type="sobol", seed=42),
         storage=storage,
         load_if_exists=True,
     )
