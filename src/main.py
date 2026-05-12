@@ -7,6 +7,7 @@ from pathlib import Path
 import numpy as np
 import optuna
 import pandas as pd
+from optuna.samplers import GridSampler
 from sklearn.metrics import classification_report, precision_recall_curve, auc
 
 from src.features.engineer import (
@@ -71,9 +72,6 @@ FEATURES_EXTENDED: list[str] = FEATURES_6_INDICATORS + [
     "hour_sin", "hour_cos", "dow_sin", "dow_cos",
 ]
 
-# Selector — hardcoded so a run is reproducible without CLI flags.
-ACTIVE_FEATURES: list[str] = FEATURES_EXTENDED
-
 MAX_HOLD_RANGES: dict[int, tuple[int, int, int]] = {
     3: (1000, 5000, 1000),
     5:  (500, 2500, 500),
@@ -97,29 +95,35 @@ def labels_cache_path(
         f"_pt{pt}_sl{sl}_hold{max_hold}.parquet"
     )
 
-# Phase-2-aligned defaults. max_depth is now a search axis (see SEARCH_SPACE).
-FIXED_RF_PARAMS: dict = {
+RF_PARAMS_FIXED: dict = {
     "n_estimators": 500,
+    "max_depth": 3,
     "min_samples_leaf": 50,
     "class_weight": "balanced",
-    "n_jobs":  -1,
     "random_state": 42,
 }
 
-# Phase-2-aligned grid (2×1×3×2×2×2 = 48). Sampled with replacement via RandomSampler.
+USE_TIME_DECAY_FIXED: bool = False
+USE_OVERLAP_FIXED: bool = False
+
 SEARCH_SPACE: dict[str, list] = {
+    "features_set":  ["extended", "6_indicators"],
     "bar_size":      [3, 15],
-    "pt_sl":         ["1.0_1.0"],
-    "cusum_h":       [0.003, 0.005, 0.008],
-    "span":          [10, 30],
+    "pt_sl":         ["1.0_1.0", "0.8_0.8", "1.2_1.2"],
+    "cusum_h":       [0.002, 0.0025, 0.003, 0.0035, 0.004, 0.005],
+    "span":          [20, 30, 40, 50],
     "max_hold_slot": [1, 2],
-    "max_depth":     [3, 4],
 }
 
-# Random sampling over the 72-cell grid. 144 ≈ 2× cells, giving ~2 hits/cell on average.
-N_TRIALS: int = 144
+# Full grid: 2 × 2 × 3 × 6 × 4 × 2 = 576 cells, run exactly once via GridSampler.
+N_TRIALS: int = 576
 
-STUDY_NAME = "dollar_bar_grid72_random_v2"
+STUDY_NAME = "dollar_bar_final_v1"
+
+FEATURE_SETS: dict[str, list[str]] = {
+    "6_indicators": FEATURES_6_INDICATORS,
+    "extended":     FEATURES_EXTENDED,
+}
 
 TEST_RATIO: float = 0.20
 
@@ -264,30 +268,26 @@ def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
 
 def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> float:
     t_trial = time.perf_counter()
-    # ── Suggested axes (6-axis grid sampled randomly) ──
+    features_set  = trial.suggest_categorical("features_set",  SEARCH_SPACE["features_set"])
     bar_size      = trial.suggest_categorical("bar_size",      SEARCH_SPACE["bar_size"])
     pt_sl_key     = trial.suggest_categorical("pt_sl",         SEARCH_SPACE["pt_sl"])
     cusum_h       = trial.suggest_categorical("cusum_h",       SEARCH_SPACE["cusum_h"])
     span          = trial.suggest_categorical("span",          SEARCH_SPACE["span"])
     max_hold_slot = trial.suggest_categorical("max_hold_slot", SEARCH_SPACE["max_hold_slot"])
-    max_depth     = trial.suggest_categorical("max_depth",     SEARCH_SPACE["max_depth"])
     pt, sl = (float(x) for x in pt_sl_key.split("_"))
     tp_sl_key = pt_sl_key
 
-    # PDF Action 1: weighting OFF (decay/overlap caused trivial-long in Phase-2 analysis).
-    use_time_decay = False
-    use_overlap    = False
-    time_decay_c   = 1.0  # no-op; kept to satisfy run_cv() signature
-
-    trial_rf_params = {**rf_params, "max_depth": max_depth}
+    active_features = FEATURE_SETS[features_set]
+    use_time_decay  = USE_TIME_DECAY_FIXED
+    use_overlap     = USE_OVERLAP_FIXED
+    time_decay_c    = 1.0  # no-op; kept to satisfy run_cv() signature
 
     low, _, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
 
     log.debug(
-        f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
+        f"Trial {trial.number:>6} | features={features_set}  bar={bar_size}M  pt/sl={tp_sl_key}"
         f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
-        f"  max_depth={max_depth}"
         f"  td={use_time_decay}  overlap={use_overlap}"
     )
 
@@ -353,8 +353,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     _, oos_df, fold_data = run_cv(
         df,
         max_hold=max_hold,
-        rf_params=trial_rf_params,
-        feature_cols=ACTIVE_FEATURES,
+        rf_params=rf_params,
+        feature_cols=active_features,
         time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
         use_overlap=use_overlap,
@@ -452,14 +452,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     prec_long = safe(oos_report["long"]["precision"])
     prec_flat = safe(oos_report["flat"]["precision"])
 
-    features_set_name = (
-        "6_indicators" if ACTIVE_FEATURES is FEATURES_6_INDICATORS
-        else "extended" if ACTIVE_FEATURES is FEATURES_EXTENDED
-        else "custom"
-    )
-    trial.set_user_attr("features_set", features_set_name)
-    trial.set_user_attr("features_count", len(ACTIVE_FEATURES))
-    trial.set_user_attr("features_list", ",".join(ACTIVE_FEATURES))
+    trial.set_user_attr("features_count", len(active_features))
+    trial.set_user_attr("features_list", ",".join(active_features))
     trial.set_user_attr("oos_auc_pr", auc_pr)
     trial.set_user_attr("oos_sharpe", oos_sharpe)
     trial.set_user_attr("oos_net_pnl", oos_net_pnl)
@@ -487,9 +481,9 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     Path("data/processed/models").mkdir(parents=True, exist_ok=True)
     model_path = f"data/processed/models/trial_{trial.number:06d}_bar{bar_size}_{SYMBOL}.pkl"
     train_final(
-        df, trial_rf_params,
+        df, rf_params,
         max_hold=max_hold,
-        feature_cols=ACTIVE_FEATURES,
+        feature_cols=active_features,
         out_path=model_path,
         time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
@@ -499,7 +493,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
 
     wall = time.perf_counter() - t_trial
     log.info(
-        f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
+        f"Trial {trial.number:>6} | features={features_set}  bar={bar_size}M  pt/sl={tp_sl_key}"
         f" span={span}  hold={max_hold}  cusum_h={cusum_h}"
         f"  td={use_time_decay}  td_c={time_decay_c}"
         f" | sharpe={oos_sharpe:+.4f}  net_pnl={oos_net_pnl:+.4f}"
@@ -531,29 +525,29 @@ def optuna_main(
     cpu_count = os.cpu_count() or 1
     if rf_n_jobs is None:
         rf_n_jobs = max(1, cpu_count // max(1, optuna_n_jobs))
-    rf_params_runtime = {**FIXED_RF_PARAMS, "n_jobs": rf_n_jobs}
+    rf_params_runtime = {**RF_PARAMS_FIXED, "n_jobs": rf_n_jobs}
 
     log.info("=" * 72)
-    log.info(f"Optuna Random Search (72-cell grid)  —  {SYMBOL}")
+    log.info(f"Optuna Grid Search (576-cell full grid)  —  {SYMBOL}")
     log.info(f"Study: {study_name}  |  Trials: {n_trials:,}")
-    log.info(f"Features ({len(ACTIVE_FEATURES)}): {ACTIVE_FEATURES}")
     log.info(
+        f"features_set ∈ {SEARCH_SPACE['features_set']}  |  "
         f"bar_size ∈ {SEARCH_SPACE['bar_size']}  |  "
         f"pt_sl ∈ {SEARCH_SPACE['pt_sl']}"
     )
     log.info(
         f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}  |  "
         f"span ∈ {SEARCH_SPACE['span']}  |  "
-        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}  |  "
-        f"max_depth ∈ {SEARCH_SPACE['max_depth']}"
+        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}"
     )
     log.info(
-        f"Fixed: use_time_decay=False  use_overlap=False  |  "
+        f"Fixed: use_time_decay={USE_TIME_DECAY_FIXED}  use_overlap={USE_OVERLAP_FIXED}  |  "
         f"Binary long-vs-short labels (flat dropped)"
     )
     log.info(
-        f"RF: n_est={FIXED_RF_PARAMS['n_estimators']}  "
-        f"min_samples_leaf={FIXED_RF_PARAMS['min_samples_leaf']}"
+        f"RF: n_est={RF_PARAMS_FIXED['n_estimators']}  "
+        f"max_depth={RF_PARAMS_FIXED['max_depth']}  "
+        f"min_samples_leaf={RF_PARAMS_FIXED['min_samples_leaf']}"
     )
     log.info(
         f"Parallel: optuna_n_jobs={optuna_n_jobs}"
@@ -568,7 +562,7 @@ def optuna_main(
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
-        sampler=optuna.samplers.RandomSampler(seed=sampler_seed),
+        sampler=GridSampler(SEARCH_SPACE, seed=sampler_seed),
         storage=storage,
         load_if_exists=True,
     )
