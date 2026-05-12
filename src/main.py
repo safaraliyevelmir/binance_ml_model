@@ -119,7 +119,7 @@ SEARCH_SPACE: dict[str, list] = {
 # Random sampling over the 72-cell grid. 144 ≈ 2× cells, giving ~2 hits/cell on average.
 N_TRIALS: int = 144
 
-STUDY_NAME = "dollar_bar_grid72_random_v1"
+STUDY_NAME = "dollar_bar_grid72_random_v2"
 
 TEST_RATIO: float = 0.20
 
