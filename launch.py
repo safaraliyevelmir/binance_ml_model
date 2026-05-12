@@ -21,9 +21,10 @@ def worker(workerId: int, trialsForMe: int) -> dict[str, int]:
     optuna_main(
         n_trials=trialsForMe,
         study_name=STUDY_NAME,
-        optuna_n_jobs=1,        # this worker = 1 thread; parallelism is across processes
+        optuna_n_jobs=1,           # this worker = 1 thread; parallelism is across processes
         rf_n_jobs=rfPerWorker,
         storage=storage,
+        sampler_seed=42 + workerId,  # distinct seed per worker → no duplicate trials
     )
     return {"worker": workerId, "trials": trialsForMe}
 

@@ -452,6 +452,14 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     prec_long = safe(oos_report["long"]["precision"])
     prec_flat = safe(oos_report["flat"]["precision"])
 
+    features_set_name = (
+        "6_indicators" if ACTIVE_FEATURES is FEATURES_6_INDICATORS
+        else "extended" if ACTIVE_FEATURES is FEATURES_EXTENDED
+        else "custom"
+    )
+    trial.set_user_attr("features_set", features_set_name)
+    trial.set_user_attr("features_count", len(ACTIVE_FEATURES))
+    trial.set_user_attr("features_list", ",".join(ACTIVE_FEATURES))
     trial.set_user_attr("oos_auc_pr", auc_pr)
     trial.set_user_attr("oos_sharpe", oos_sharpe)
     trial.set_user_attr("oos_net_pnl", oos_net_pnl)
@@ -508,6 +516,7 @@ def optuna_main(
     optuna_n_jobs: int = 1,
     rf_n_jobs: int | None = None,
     storage: str | None = None,
+    sampler_seed: int | None = 42,
 ) -> None:
     import os
     # Pin BLAS/OpenBLAS/MKL to 1 thread to prevent over-subscription when
@@ -559,7 +568,7 @@ def optuna_main(
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
-        sampler=optuna.samplers.RandomSampler(seed=42),
+        sampler=optuna.samplers.RandomSampler(seed=sampler_seed),
         storage=storage,
         load_if_exists=True,
     )
