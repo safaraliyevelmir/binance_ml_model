@@ -11,12 +11,24 @@ from sklearn.metrics import classification_report, precision_recall_curve, auc
 
 from src.features.engineer import (
     adx_features,
+    atr_norm,
     bollinger_bands,
+    buy_ratio,
+    co_range,
+    cyclical_time_features,
+    dist_to_sma,
     frac_diff_ffd,
+    hl_range,
+    lagged_log_returns,
     log_returns,
     macd_features,
+    ofi_ema,
+    rate_of_change,
+    realized_vol,
     rsi_feature,
     stochastic_rsi,
+    trade_intensity,
+    volume_zscore,
 )
 from src.model.metrics import (
     sharpe_ratio,
@@ -26,7 +38,13 @@ from src.model.metrics import (
 from src.model.train import SYMBOL, run_cv, train_final
 from src.pre_process.trippler_barrier import getDailyVol, label_bars
 
-OPTUNA_FEATURE_COLS = [
+# ─── Feature lists ───────────────────────────────────────────────────────────
+# All features below are CAUSAL: at row t they depend only on bar data from
+# rows ≤ t (backward rolling, .shift(k>0), or per-bar values known at close).
+# No t1_time, no labels, no future bars are touched.
+
+# List 1: original 6 indicator families (12 columns).
+FEATURES_6_INDICATORS: list[str] = [
     "frac_diff",
     "bb_pct_b", "bb_width",
     "rsi",
@@ -34,6 +52,27 @@ OPTUNA_FEATURE_COLS = [
     "adx", "adx_pdi", "adx_mdi",
     "stoch_rsi_k", "stoch_rsi_d",
 ]
+
+# List 2: extended feature set. Adds microstructure, volatility, momentum,
+# range, lagged returns, and cyclical time on top of the 6 indicator families.
+FEATURES_EXTENDED: list[str] = FEATURES_6_INDICATORS + [
+    # microstructure (per-bar; ofi/buy_volume/sell_volume/trades are bar-local)
+    "ofi", "ofi_ema",
+    "buy_ratio", "vol_zscore", "trade_intensity",
+    # volatility & bar shape
+    "atr_norm", "realized_vol_20",
+    "hl_range", "co_range",
+    # momentum & mean-reversion (backward windows only)
+    "roc_5", "roc_20",
+    "dist_to_sma20", "dist_to_sma50",
+    # lagged returns
+    "log_return_lag1", "log_return_lag2",
+    # cyclical time-of-day / day-of-week
+    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
+]
+
+# Selector — hardcoded so a run is reproducible without CLI flags.
+ACTIVE_FEATURES: list[str] = FEATURES_EXTENDED
 
 MAX_HOLD_RANGES: dict[int, tuple[int, int, int]] = {
     3: (1000, 5000, 1000),
@@ -45,10 +84,6 @@ MAX_HOLD_RANGES: dict[int, tuple[int, int, int]] = {
     50: (50,   250,  50),
     60: (25,   125,  25),
 }
-
-FIXED_BAR_SIZE = 15
-FIXED_PT = 1.2
-FIXED_SL = 1.0
 
 LABELS_CACHE_DIR = Path("data/processed/labels")
 
@@ -62,30 +97,36 @@ def labels_cache_path(
         f"_pt{pt}_sl{sl}_hold{max_hold}.parquet"
     )
 
+# Phase-2-aligned: max_depth=4, min_samples_leaf=50 are now fixed (PDF Action 1).
 FIXED_RF_PARAMS: dict = {
     "n_estimators": 500,
+    "max_depth": 4,
+    "min_samples_leaf": 50,
     "class_weight": "balanced",
     "n_jobs":  -1,
     "random_state": 42,
 }
 
+# Phase-2-aligned 72-cell grid (2×3×3×2×2). Sampled with replacement via RandomSampler.
 SEARCH_SPACE: dict[str, list] = {
-    "span":             [10, 20, 30, 40, 50],
-    "max_hold_slot":    [0, 1, 2, 3, 4],
-    "cusum_h":          [0.002, 0.005, 0.008, 0.01, 0.015, 0.02],
-    "time_decay_c":     [-0.25, 0.0, 0.25, 0.5, 0.75, 1.0],
-    "use_overlap":      [True, False],
-    "max_depth":        [4, 5, 6, 7],
-    "min_samples_leaf": [1, 2, 4, 8, 16, 32, 64, 128],
+    "bar_size":      [3, 15],
+    "pt_sl":         ["1.0_1.0"],
+    "cusum_h":       [0.003, 0.005, 0.008],
+    "span":          [10, 30],
+    "max_hold_slot": [1, 2],
 }
 
-# QMC (Sobol) budget. Sobol sequences are best at powers of 2; 512 fills the
-# lattice cleanly. Override via --n-trials if you want a different budget.
-N_TRIALS: int = 512
+# Random sampling over the 72-cell grid. 144 ≈ 2× cells, giving ~2 hits/cell on average.
+N_TRIALS: int = 144
 
-STUDY_NAME = "dollar_bar_15M_sobol_exp4"
+STUDY_NAME = "dollar_bar_grid72_random_v1"
 
 TEST_RATIO: float = 0.20
+
+# ─── Runtime knobs (hardcoded; no CLI) ───────────────────────────────────────
+RUN_OPTUNA_N_JOBS: int = 4
+RUN_RF_N_JOBS: int | None = None  # None → cpu_count // RUN_OPTUNA_N_JOBS
+RUN_STORAGE: str | None = "sqlite:///optuna.db"
 
 
 def safe(v: float) -> float:
@@ -133,24 +174,48 @@ def cusum_filter(close: pd.Series, h: float) -> pd.Index:
 
 def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute all indicators on the FULL contiguous bar sequence.
-    Must be called BEFORE any CUSUM filtering so rolling windows have no gaps.
-    Returns a DataFrame with the same RangeIndex as bars.
+    Compute the superset of features (6 indicators + extended set) on the FULL
+    contiguous bar sequence. Must be called BEFORE any CUSUM filtering so
+    rolling windows have no gaps. Returns a DataFrame with the same RangeIndex
+    as bars.
+
+    Leakage note: every column produced here is causal — backward-rolling
+    windows, .shift(k>0), or bar-local values known at close. No future bars
+    are referenced.
     """
     lr = log_returns(bars)
     log_price = pd.Series(np.log(bars["close"].to_numpy(dtype=np.float64)), index=bars.index)
     fd = frac_diff_ffd(log_price, d=1.0)  # placeholder: run_cv overrides per fold with ADF-selected d
+
+    # 6 indicator families
     bb_pct_b, bb_width = bollinger_bands(bars)
     rsi_val = rsi_feature(bars)
     macd_line, macd_sig, macd_hist = macd_features(bars)
     adx_val, adx_pdi, adx_mdi = adx_features(bars)
     stoch_k, stoch_d = stochastic_rsi(bars)
 
-    return pd.DataFrame({
+    # Extended set (all causal)
+    atr = atr_norm(bars, period=14)
+    rv20 = realized_vol(bars, window=20)
+    roc5 = rate_of_change(bars, window=5)
+    roc20 = rate_of_change(bars, window=20)
+    d_sma20 = dist_to_sma(bars, window=20)
+    d_sma50 = dist_to_sma(bars, window=50)
+    hl_r = hl_range(bars)
+    co_r = co_range(bars)
+    br = buy_ratio(bars)
+    vz = volume_zscore(bars, window=50)
+    ti = trade_intensity(bars, window=50)
+    oema = ofi_ema(bars, span=10)
+    lags = lagged_log_returns(bars, lags=(1, 2))
+    cyc = cyclical_time_features(bars)
+
+    out = pd.DataFrame({
         "open_time":    bars["open_time"].values,
         "close_time":   bars["close_time"].values,
         "close":        bars["close"].values,
         "log_return":   lr.values,
+        # 6 indicator families
         "frac_diff":    fd.values,
         "bb_pct_b":     bb_pct_b.values,
         "bb_width":     bb_width.values,
@@ -163,37 +228,53 @@ def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
         "adx_mdi":      adx_mdi.values,
         "stoch_rsi_k":  stoch_k.values,
         "stoch_rsi_d":  stoch_d.values,
+        # extended: microstructure
+        "ofi":              bars["ofi"].values,
+        "ofi_ema":          oema.values,
+        "buy_ratio":        br.values,
+        "vol_zscore":       vz.values,
+        "trade_intensity":  ti.values,
+        # extended: volatility / range
+        "atr_norm":         atr.values,
+        "realized_vol_20":  rv20.values,
+        "hl_range":         hl_r.values,
+        "co_range":         co_r.values,
+        # extended: momentum / mean-reversion
+        "roc_5":            roc5.values,
+        "roc_20":           roc20.values,
+        "dist_to_sma20":    d_sma20.values,
+        "dist_to_sma50":    d_sma50.values,
+        # extended: lagged returns
+        "log_return_lag1":  lags["log_return_lag1"].values,
+        "log_return_lag2":  lags["log_return_lag2"].values,
+        # extended: cyclical time
+        "hour_sin":         cyc["hour_sin"].values,
+        "hour_cos":         cyc["hour_cos"].values,
+        "dow_sin":          cyc["dow_sin"].values,
+        "dow_cos":          cyc["dow_cos"].values,
     }, index=pd.RangeIndex(len(bars)))
+    return out
 
 
 # ── Optuna Grid Search ──────────────────────────────────────────────────────────
 
 def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> float:
     t_trial = time.perf_counter()
-    # ── Fixed axes for this experiment ──
-    bar_size = FIXED_BAR_SIZE
-    pt, sl = FIXED_PT, FIXED_SL
-    tp_sl_key = f"{pt}_{sl}"
-
-    # ── Suggested axes ──
-    span = trial.suggest_categorical("span", SEARCH_SPACE["span"])
+    # ── Suggested axes (6-axis grid sampled randomly) ──
+    bar_size      = trial.suggest_categorical("bar_size",      SEARCH_SPACE["bar_size"])
+    pt_sl_key     = trial.suggest_categorical("pt_sl",         SEARCH_SPACE["pt_sl"])
+    cusum_h       = trial.suggest_categorical("cusum_h",       SEARCH_SPACE["cusum_h"])
+    span          = trial.suggest_categorical("span",          SEARCH_SPACE["span"])
     max_hold_slot = trial.suggest_categorical("max_hold_slot", SEARCH_SPACE["max_hold_slot"])
-    cusum_h = trial.suggest_categorical("cusum_h", SEARCH_SPACE["cusum_h"])
-    time_decay_c = trial.suggest_categorical("time_decay_c", SEARCH_SPACE["time_decay_c"])
-    use_overlap = trial.suggest_categorical("use_overlap", SEARCH_SPACE["use_overlap"])
-    max_depth = trial.suggest_categorical("max_depth", SEARCH_SPACE["max_depth"])
-    min_samples_leaf = trial.suggest_categorical(
-        "min_samples_leaf", SEARCH_SPACE["min_samples_leaf"]
-    )
+    pt, sl = (float(x) for x in pt_sl_key.split("_"))
+    tp_sl_key = pt_sl_key
 
-    # AFML Eq 4.10 baseline (|ret|) is always on. c=1.0 ⇒ flat decay (no-op).
-    use_time_decay = True
+    # PDF Action 1: weighting OFF (decay/overlap caused trivial-long in Phase-2 analysis).
+    use_time_decay = False
+    use_overlap    = False
+    time_decay_c   = 1.0  # no-op; kept to satisfy run_cv() signature
 
-    trial_rf_params = {
-        **rf_params,
-        "max_depth": max_depth,
-        "min_samples_leaf": min_samples_leaf,
-    }
+    trial_rf_params = rf_params  # max_depth/min_samples_leaf already fixed in FIXED_RF_PARAMS
 
     low, _, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
@@ -201,8 +282,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     log.debug(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
         f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
-        f"  td_c={time_decay_c}  overlap={use_overlap}"
-        f"  max_depth={max_depth}  leaf={min_samples_leaf}"
+        f"  td={use_time_decay}  overlap={use_overlap}"
     )
 
     # ── 1. Load bars — slice to train/val; test set is never touched during Optuna ──
@@ -257,10 +337,9 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     df["label"] = labels_df["label"].values
     df["ret"] = labels_df["return"].values
 
-    # ── 7. Long-only binary: drop hold(0), remap short(-1) → 0 ──
-    df = df[df["label"] != 0].copy()
+    # ── 7. Long-vs-rest binary: long(+1) → 1, flat(0) + short(-1) → 0 (keep all bars) ──
     df["label"] = (df["label"] == 1).astype(int)
-    log.debug(f"Binary: {len(df):,}  dist={df['label'].value_counts().to_dict()}")
+    log.debug(f"Binary long-vs-rest: {len(df):,}  dist={df['label'].value_counts().to_dict()}")
 
     # ── 8. 5-fold Purged CV ──
     t_cv = time.perf_counter()
@@ -268,7 +347,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
         df,
         max_hold=max_hold,
         rf_params=trial_rf_params,
-        feature_cols=OPTUNA_FEATURE_COLS,
+        feature_cols=ACTIVE_FEATURES,
         time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
         use_overlap=use_overlap,
@@ -341,6 +420,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     )
     oos_bars_per_year = compute_bars_per_year(pd.DatetimeIndex(oos_df["close_time"]))
     oos_sharpe = safe(sharpe_ratio(strat_ret, oos_bars_per_year))
+    # Net PnL: cumulative compounded return over OOS log returns (no fees).
+    oos_net_pnl = safe(float(np.exp(np.nansum(np.asarray(strat_ret, dtype=float))) - 1.0))
 
     oos_report = classification_report(
         oos_df["y_true"].to_numpy(),
@@ -366,6 +447,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
 
     trial.set_user_attr("oos_auc_pr", auc_pr)
     trial.set_user_attr("oos_sharpe", oos_sharpe)
+    trial.set_user_attr("oos_net_pnl", oos_net_pnl)
     trial.set_user_attr("oos_f1_macro", macro_f1)
     trial.set_user_attr("oos_accuracy", accuracy)
     trial.set_user_attr("oos_f1_long", f1_long)
@@ -392,7 +474,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     train_final(
         df, trial_rf_params,
         max_hold=max_hold,
-        feature_cols=OPTUNA_FEATURE_COLS,
+        feature_cols=ACTIVE_FEATURES,
         out_path=model_path,
         time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
@@ -405,8 +487,8 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
         f" span={span}  hold={max_hold}  cusum_h={cusum_h}"
         f"  td={use_time_decay}  td_c={time_decay_c}"
-        f" | sharpe={oos_sharpe:+.4f}  f1_macro={macro_f1:.4f}"
-        f"  acc={accuracy:.4f}  f1_long={f1_long:.4f}"
+        f" | sharpe={oos_sharpe:+.4f}  net_pnl={oos_net_pnl:+.4f}"
+        f"  f1_macro={macro_f1:.4f}  acc={accuracy:.4f}  f1_long={f1_long:.4f}"
         f" prec_long={prec_long:.4f}  rec_long={recall_long:.4f}"
         f"  | {wall:.0f}s"
     )
@@ -436,26 +518,26 @@ def optuna_main(
     rf_params_runtime = {**FIXED_RF_PARAMS, "n_jobs": rf_n_jobs}
 
     log.info("=" * 72)
-    log.info(f"Optuna QMC (Sobol) Search  —  {SYMBOL}")
+    log.info(f"Optuna Random Search (72-cell grid)  —  {SYMBOL}")
     log.info(f"Study: {study_name}  |  Trials: {n_trials:,}")
+    log.info(f"Features ({len(ACTIVE_FEATURES)}): {ACTIVE_FEATURES}")
     log.info(
-        f"Fixed: bar={FIXED_BAR_SIZE}M  pt/sl={FIXED_PT}/{FIXED_SL}"
+        f"bar_size ∈ {SEARCH_SPACE['bar_size']}  |  "
+        f"pt_sl ∈ {SEARCH_SPACE['pt_sl']}"
     )
-    log.info(f"Features ({len(OPTUNA_FEATURE_COLS)}): {OPTUNA_FEATURE_COLS}")
     log.info(
+        f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}  |  "
         f"span ∈ {SEARCH_SPACE['span']}  |  "
-        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}  |  "
-        f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}"
+        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}"
     )
     log.info(
-        f"time_decay_c ∈ {SEARCH_SPACE['time_decay_c']}  |  "
-        f"use_overlap ∈ {SEARCH_SPACE['use_overlap']}  |  "
-        f"Binary long-only labels"
+        f"Fixed: use_time_decay=False  use_overlap=False  |  "
+        f"Binary long-vs-rest labels"
     )
     log.info(
         f"RF: n_est={FIXED_RF_PARAMS['n_estimators']}  "
-        f"max_depth ∈ {SEARCH_SPACE['max_depth']}  "
-        f"min_samples_leaf ∈ {SEARCH_SPACE['min_samples_leaf']}"
+        f"max_depth={FIXED_RF_PARAMS['max_depth']}  "
+        f"min_samples_leaf={FIXED_RF_PARAMS['min_samples_leaf']}"
     )
     log.info(
         f"Parallel: optuna_n_jobs={optuna_n_jobs}"
@@ -470,7 +552,7 @@ def optuna_main(
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
-        sampler=optuna.samplers.QMCSampler(qmc_type="sobol", seed=42),
+        sampler=optuna.samplers.RandomSampler(seed=42),
         storage=storage,
         load_if_exists=True,
     )
@@ -499,21 +581,10 @@ def optuna_main(
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Optuna grid search")
-    parser.add_argument("--n-jobs", type=int, default=1,
-                        help="Parallel Optuna trials (use 1 with --multiprocess)")
-    parser.add_argument("--rf-jobs", type=int, default=None,
-                        help="RF cores per worker (default: cpu_count // n-jobs)")
-    parser.add_argument("--n-trials", type=int, default=N_TRIALS)
-    parser.add_argument("--study-name", type=str, default=STUDY_NAME)
-    parser.add_argument("--storage", type=str, default=None,
-                        help="e.g. sqlite:///optuna.db  (required for --multiprocess)")
-    args = parser.parse_args()
     optuna_main(
-        n_trials=args.n_trials,
-        study_name=args.study_name,
-        optuna_n_jobs=args.n_jobs,
-        rf_n_jobs=args.rf_jobs,
-        storage=args.storage,
+        n_trials=N_TRIALS,
+        study_name=STUDY_NAME,
+        optuna_n_jobs=RUN_OPTUNA_N_JOBS,
+        rf_n_jobs=RUN_RF_N_JOBS,
+        storage=RUN_STORAGE,
     )

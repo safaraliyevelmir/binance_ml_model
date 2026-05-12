@@ -191,6 +191,94 @@ def stochastic_rsi(
     return k, d
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Extended feature set. All functions below are CAUSAL (backward-only rolling),
+# so no information from t+1..T leaks into the feature at time t.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def atr_norm(bars: pd.DataFrame, period: int = 14) -> pd.Series:
+    """ATR(period) / close. Causal: uses high/low/close known at bar close."""
+    a = ta.atr(bars["high"], bars["low"], bars["close"], length=period)
+    return (a / bars["close"].replace(0.0, np.nan)).rename("atr_norm")
+
+
+def realized_vol(bars: pd.DataFrame, window: int = 20) -> pd.Series:
+    """Backward rolling std of log returns over `window` bars."""
+    lr = np.log(bars["close"] / bars["close"].shift(1))
+    return lr.rolling(window, min_periods=window).std().rename(f"realized_vol_{window}")
+
+
+def rate_of_change(bars: pd.DataFrame, window: int) -> pd.Series:
+    """close[t]/close[t-window] - 1. Pure backward lookup."""
+    c = bars["close"]
+    return (c / c.shift(window) - 1.0).rename(f"roc_{window}")
+
+
+def dist_to_sma(bars: pd.DataFrame, window: int) -> pd.Series:
+    """Percent deviation of close from its backward SMA(window)."""
+    c = bars["close"]
+    sma = c.rolling(window, min_periods=window).mean()
+    return (c / sma - 1.0).rename(f"dist_to_sma{window}")
+
+
+def hl_range(bars: pd.DataFrame) -> pd.Series:
+    """(high - low) / close at bar close. No look-ahead."""
+    return ((bars["high"] - bars["low"]) / bars["close"].replace(0.0, np.nan)).rename("hl_range")
+
+
+def co_range(bars: pd.DataFrame) -> pd.Series:
+    """(close - open) / open. Body size, known at bar close."""
+    return ((bars["close"] - bars["open"]) / bars["open"].replace(0.0, np.nan)).rename("co_range")
+
+
+def buy_ratio(bars: pd.DataFrame) -> pd.Series:
+    """buy_volume / (buy + sell). Bar-local, no rolling, no leakage."""
+    total = (bars["buy_volume"] + bars["sell_volume"]).replace(0.0, np.nan)
+    return (bars["buy_volume"] / total).rename("buy_ratio")
+
+
+def volume_zscore(bars: pd.DataFrame, window: int = 50) -> pd.Series:
+    """z-score of dollar_volume vs backward rolling mean/std."""
+    v = bars["dollar_volume"]
+    mu = v.rolling(window, min_periods=window).mean()
+    sd = v.rolling(window, min_periods=window).std().replace(0.0, np.nan)
+    return ((v - mu) / sd).rename("vol_zscore")
+
+
+def trade_intensity(bars: pd.DataFrame, window: int = 50) -> pd.Series:
+    """trades / backward rolling mean(trades, window). Captures activity spikes."""
+    t = bars["trades"].astype(np.float64)
+    mu = t.rolling(window, min_periods=window).mean().replace(0.0, np.nan)
+    return (t / mu).rename("trade_intensity")
+
+
+def ofi_ema(bars: pd.DataFrame, span: int = 10) -> pd.Series:
+    """Backward EWM of order-flow imbalance. pandas .ewm is causal by default."""
+    return bars["ofi"].ewm(span=span, adjust=False).mean().rename("ofi_ema")
+
+
+def lagged_log_returns(bars: pd.DataFrame, lags: tuple[int, ...] = (1, 2)) -> dict[str, pd.Series]:
+    """Lagged log returns. shift(k) only uses past, so causal."""
+    lr = np.log(bars["close"] / bars["close"].shift(1))
+    return {f"log_return_lag{k}": lr.shift(k).rename(f"log_return_lag{k}") for k in lags}
+
+
+def cyclical_time_features(bars: pd.DataFrame) -> dict[str, pd.Series]:
+    """
+    Cyclical encoding of close_time hour-of-day & day-of-week.
+    close_time is known at bar close, so these are causal.
+    """
+    ts = pd.to_datetime(bars["close_time"])
+    hour = ts.dt.hour.astype(np.float64)
+    dow = ts.dt.dayofweek.astype(np.float64)
+    return {
+        "hour_sin": np.sin(2 * np.pi * hour / 24.0).rename("hour_sin"),
+        "hour_cos": np.cos(2 * np.pi * hour / 24.0).rename("hour_cos"),
+        "dow_sin":  np.sin(2 * np.pi * dow / 7.0).rename("dow_sin"),
+        "dow_cos":  np.cos(2 * np.pi * dow / 7.0).rename("dow_cos"),
+    }
+
+
 
 def build_features(
     bars_path: str,
