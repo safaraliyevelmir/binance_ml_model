@@ -97,23 +97,23 @@ def labels_cache_path(
         f"_pt{pt}_sl{sl}_hold{max_hold}.parquet"
     )
 
-# Phase-2-aligned: max_depth=4, min_samples_leaf=50 are now fixed (PDF Action 1).
+# Phase-2-aligned defaults. max_depth is now a search axis (see SEARCH_SPACE).
 FIXED_RF_PARAMS: dict = {
     "n_estimators": 500,
-    "max_depth": 4,
     "min_samples_leaf": 50,
     "class_weight": "balanced",
     "n_jobs":  -1,
     "random_state": 42,
 }
 
-# Phase-2-aligned 72-cell grid (2×3×3×2×2). Sampled with replacement via RandomSampler.
+# Phase-2-aligned grid (2×1×3×2×2×2 = 48). Sampled with replacement via RandomSampler.
 SEARCH_SPACE: dict[str, list] = {
     "bar_size":      [3, 15],
     "pt_sl":         ["1.0_1.0"],
     "cusum_h":       [0.003, 0.005, 0.008],
     "span":          [10, 30],
     "max_hold_slot": [1, 2],
+    "max_depth":     [3, 4],
 }
 
 # Random sampling over the 72-cell grid. 144 ≈ 2× cells, giving ~2 hits/cell on average.
@@ -124,8 +124,12 @@ STUDY_NAME = "dollar_bar_grid72_random_v1"
 TEST_RATIO: float = 0.20
 
 # ─── Runtime knobs (hardcoded; no CLI) ───────────────────────────────────────
-RUN_OPTUNA_N_JOBS: int = 4
-RUN_RF_N_JOBS: int | None = None  # None → cpu_count // RUN_OPTUNA_N_JOBS
+# Each `python -m src.main` invocation is a SINGLE worker: it runs trials
+# sequentially within its own process. To run several workers in parallel,
+# either use `python launch.py` (ProcessPool) or open N terminals and call
+# `python -m src.main` in each. Workers share state via the sqlite study.
+RUN_OPTUNA_N_JOBS: int = 1        # threads within a worker (keep at 1 — see launch.py)
+RUN_RF_N_JOBS: int | None = None  # None → all CPUs (good for single-worker mode)
 RUN_STORAGE: str | None = "sqlite:///optuna.db"
 
 
@@ -266,6 +270,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     cusum_h       = trial.suggest_categorical("cusum_h",       SEARCH_SPACE["cusum_h"])
     span          = trial.suggest_categorical("span",          SEARCH_SPACE["span"])
     max_hold_slot = trial.suggest_categorical("max_hold_slot", SEARCH_SPACE["max_hold_slot"])
+    max_depth     = trial.suggest_categorical("max_depth",     SEARCH_SPACE["max_depth"])
     pt, sl = (float(x) for x in pt_sl_key.split("_"))
     tp_sl_key = pt_sl_key
 
@@ -274,7 +279,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     use_overlap    = False
     time_decay_c   = 1.0  # no-op; kept to satisfy run_cv() signature
 
-    trial_rf_params = rf_params  # max_depth/min_samples_leaf already fixed in FIXED_RF_PARAMS
+    trial_rf_params = {**rf_params, "max_depth": max_depth}
 
     low, _, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
@@ -282,6 +287,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     log.debug(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
         f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
+        f"  max_depth={max_depth}"
         f"  td={use_time_decay}  overlap={use_overlap}"
     )
 
@@ -337,9 +343,10 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     df["label"] = labels_df["label"].values
     df["ret"] = labels_df["return"].values
 
-    # ── 7. Long-vs-rest binary: long(+1) → 1, flat(0) + short(-1) → 0 (keep all bars) ──
+    # ── 7. Long-vs-short binary: drop flat(0); long(+1) → 1, short(-1) → 0 ──
+    df = df[df["label"] != 0].copy()
     df["label"] = (df["label"] == 1).astype(int)
-    log.debug(f"Binary long-vs-rest: {len(df):,}  dist={df['label'].value_counts().to_dict()}")
+    log.debug(f"Binary long-vs-short: {len(df):,}  dist={df['label'].value_counts().to_dict()}")
 
     # ── 8. 5-fold Purged CV ──
     t_cv = time.perf_counter()
@@ -528,15 +535,15 @@ def optuna_main(
     log.info(
         f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}  |  "
         f"span ∈ {SEARCH_SPACE['span']}  |  "
-        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}"
+        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}  |  "
+        f"max_depth ∈ {SEARCH_SPACE['max_depth']}"
     )
     log.info(
         f"Fixed: use_time_decay=False  use_overlap=False  |  "
-        f"Binary long-vs-rest labels"
+        f"Binary long-vs-short labels (flat dropped)"
     )
     log.info(
         f"RF: n_est={FIXED_RF_PARAMS['n_estimators']}  "
-        f"max_depth={FIXED_RF_PARAMS['max_depth']}  "
         f"min_samples_leaf={FIXED_RF_PARAMS['min_samples_leaf']}"
     )
     log.info(
