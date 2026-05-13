@@ -1,42 +1,39 @@
+import contextlib
+import io
+import json
 import logging
 import math
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import optuna
 import pandas as pd
-from optuna.samplers import GridSampler
+from optuna.samplers import TPESampler
 from sklearn.metrics import classification_report, precision_recall_curve, auc
 
 from src.features.engineer import (
     adx_features,
-    atr_norm,
     bollinger_bands,
-    buy_ratio,
-    co_range,
-    cyclical_time_features,
-    dist_to_sma,
     frac_diff_ffd,
-    hl_range,
-    lagged_log_returns,
     log_returns,
     macd_features,
-    ofi_ema,
-    rate_of_change,
-    realized_vol,
     rsi_feature,
     stochastic_rsi,
-    trade_intensity,
-    volume_zscore,
+)
+from src.backtest_utils import (
+    FEE_BPS_PER_SIDE_DEFAULT,
+    SLIPPAGE_BPS_PER_SIDE_DEFAULT,
+    realistic_backtest,
 )
 from src.model.metrics import (
     sharpe_ratio,
     strategy_log_returns,
     compute_bars_per_year
 )
-from src.model.train import SYMBOL, run_cv, train_final
+from src.model.train import SYMBOL, run_cv
 from src.pre_process.trippler_barrier import getDailyVol, label_bars
 
 # ─── Feature lists ───────────────────────────────────────────────────────────
@@ -44,7 +41,7 @@ from src.pre_process.trippler_barrier import getDailyVol, label_bars
 # rows ≤ t (backward rolling, .shift(k>0), or per-bar values known at close).
 # No t1_time, no labels, no future bars are touched.
 
-# List 1: original 6 indicator families (12 columns).
+# Original 6 indicator families (12 columns). Only feature set used by training.
 FEATURES_6_INDICATORS: list[str] = [
     "frac_diff",
     "bb_pct_b", "bb_width",
@@ -54,33 +51,13 @@ FEATURES_6_INDICATORS: list[str] = [
     "stoch_rsi_k", "stoch_rsi_d",
 ]
 
-# List 2: extended feature set. Adds microstructure, volatility, momentum,
-# range, lagged returns, and cyclical time on top of the 6 indicator families.
-FEATURES_EXTENDED: list[str] = FEATURES_6_INDICATORS + [
-    # microstructure (per-bar; ofi/buy_volume/sell_volume/trades are bar-local)
-    "ofi", "ofi_ema",
-    "buy_ratio", "vol_zscore", "trade_intensity",
-    # volatility & bar shape
-    "atr_norm", "realized_vol_20",
-    "hl_range", "co_range",
-    # momentum & mean-reversion (backward windows only)
-    "roc_5", "roc_20",
-    "dist_to_sma20", "dist_to_sma50",
-    # lagged returns
-    "log_return_lag1", "log_return_lag2",
-    # cyclical time-of-day / day-of-week
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-]
-
 MAX_HOLD_RANGES: dict[int, tuple[int, int, int]] = {
-    3: (1000, 5000, 1000),
-    5:  (500, 2500, 500),
-    # 10: (250, 1250, 250),
-    15: (150,  750, 150),
-    # 20: (125,  625, 125),
-    25: (100,  500, 100),
-    50: (50,   250,  50),
-    60: (25,   125,  25),
+    # (low, high, step). objective() uses: max_hold = low + max_hold_slot * step,
+    # with slot ∈ [1..10] → 10 distinct values per bar_size.
+    3:  (500, 5000, 500),   # 1000..5500
+    5:  (300, 3000, 300),   #  600..3300
+    15: (100, 1000, 100),   #  200..1100
+    25: (60,   600,  60),   #  120..660
 }
 
 LABELS_CACHE_DIR = Path("data/processed/labels")
@@ -97,7 +74,7 @@ def labels_cache_path(
 
 RF_PARAMS_FIXED: dict = {
     "n_estimators": 500,
-    "max_depth": 3,
+    "max_depth": 4,
     "min_samples_leaf": 50,
     "class_weight": "balanced",
     "random_state": 42,
@@ -107,23 +84,28 @@ USE_TIME_DECAY_FIXED: bool = False
 USE_OVERLAP_FIXED: bool = False
 
 SEARCH_SPACE: dict[str, list] = {
-    "features_set":  ["extended", "6_indicators"],
-    "bar_size":      [3, 15],
-    "pt_sl":         ["1.0_1.0", "0.8_0.8", "1.2_1.2"],
-    "cusum_h":       [0.002, 0.0025, 0.003, 0.0035, 0.004, 0.005],
-    "span":          [20, 30, 40, 50],
-    "max_hold_slot": [1, 2],
+    "bar_size":      [3, 5, 15, 25],                                                 # 4
+    "pt_sl":         [
+        # symmetric (9)
+        "0.5_0.5",
+        "0.6_0.6", "0.7_0.7", "0.8_0.8", "0.9_0.9", "1.0_1.0",
+        "1.1_1.1", "1.2_1.2", "1.3_1.3",
+        # asymmetric (5)
+        "0.8_1.2", "1.2_0.8", "1.0_1.5", "1.5_1.0", "0.7_1.4",
+    ],                                                                               # 14
+    "cusum_h":       [
+        0.0015, 0.002, 0.0025, 0.003, 0.0035,
+        0.004, 0.0045, 0.005, 0.0055, 0.006,
+        0.0065, 0.007, 0.0075, 0.008, 0.009,
+    ],                                                                               # 15
+    "span":          [10, 15, 20, 25, 30, 35, 40, 50, 60, 80],                       # 10
+    "max_hold_slot": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],                                # 10
 }
 
-# Full grid: 2 × 2 × 3 × 6 × 4 × 2 = 576 cells, run exactly once via GridSampler.
-N_TRIALS: int = 576
+# Theoretical space: 4 × 14 × 15 × 10 × 10 = 84,000 combos. TPE samples N_TRIALS.
+N_TRIALS: int = 1000
 
-STUDY_NAME = "dollar_bar_final_v1"
-
-FEATURE_SETS: dict[str, list[str]] = {
-    "6_indicators": FEATURES_6_INDICATORS,
-    "extended":     FEATURES_EXTENDED,
-}
+STUDY_NAME = "dollar_bar_tpe_v1"
 
 TEST_RATIO: float = 0.20
 
@@ -143,25 +125,208 @@ def safe(v: float) -> float:
     return float(v)
 
 
-def setup_logging(run_name: str) -> logging.Logger:
-    Path("logs").mkdir(exist_ok=True)
+# ── Composite score weights ─────────────────────────────────────────────────
+# Optimizes for: OOS long-side precision AND recall BOTH high AND balanced,
+# with strong overfit penalty and per-fold f1_long stability penalty.
+# No Sharpe / backtest term in the score (kept as user_attrs for inspection).
+W_MIN_PR:   float = 1.5   # min(prec_long, recall_long)            [0, 1] — both must be high
+W_BALANCE:  float = 1.0   # |prec_long - recall_long|              [0, 1] — punishes asymmetry
+W_F1_LONG:  float = 0.5   # OOS f1_long                            [0, 1] — smooth tiebreaker
+W_OVERFIT:  float = 5.0   # max(0, mean(train_acc) - mean(test_acc))  typ. [0, 0.3] — heavy penalty
+W_FOLD_STD: float = 1.0   # std of per-fold f1_long                typ. [0, 0.3] — stability
+
+
+def composite_score(
+    oos_prec_long: float,
+    oos_recall_long: float,
+    oos_f1_long: float,
+    fold_train_accs: list[float],
+    fold_test_accs: list[float],
+    fold_f1_longs: list[float],
+) -> tuple[float, dict]:
+    """Weighted-sum score that rewards configurations where OOS long-class
+    precision and recall are both high *and* balanced, while penalising
+    train/test overfit gap and per-fold f1_long instability.
+
+    Components (signed):
+        + W_MIN_PR  * min(prec_long, recall_long)         — both high
+        - W_BALANCE * |prec_long - recall_long|           — balanced
+        + W_F1_LONG * f1_long                             — smoothing
+        - W_OVERFIT * max(0, mean(train_acc)-mean(test_acc))  — generalization
+        - W_FOLD_STD* std(fold_f1_longs)                  — stability
+    """
+    prec_long   = safe(oos_prec_long)
+    recall_long = safe(oos_recall_long)
+    f1_long     = safe(oos_f1_long)
+    min_pr      = min(prec_long, recall_long)
+    balance_gap = abs(prec_long - recall_long)
+    overfit_gap = max(
+        0.0,
+        float(np.mean(fold_train_accs)) - float(np.mean(fold_test_accs)),
+    )
+    fold_std    = float(np.std(fold_f1_longs, ddof=0)) if len(fold_f1_longs) > 1 else 0.0
+    score = (
+        W_MIN_PR    * min_pr
+        - W_BALANCE * balance_gap
+        + W_F1_LONG * f1_long
+        - W_OVERFIT * overfit_gap
+        - W_FOLD_STD* fold_std
+    )
+    breakdown = {
+        "score_prec_long":     prec_long,
+        "score_recall_long":   recall_long,
+        "score_f1_long":       f1_long,
+        "score_min_pr":        min_pr,
+        "score_balance_gap":   balance_gap,
+        "score_overfit_gap":   overfit_gap,
+        "score_fold_f1_std":   fold_std,
+        "score_total":         float(score),
+    }
+    return float(score), breakdown
+
+
+def setup_logging(run_name: str) -> tuple[logging.Logger, Path, Path]:
+    """Create the run logger. Returns (logger, log_path, jsonl_path).
+
+    Two sinks:
+      - console (StreamHandler, INFO): clean dense per-trial line; banners.
+      - file    (FileHandler,   DEBUG): everything above + per-fold breakdowns
+        + captured `label_bars` stdout chatter.
+
+    JSONL path (one trial-record per line) is returned alongside so the caller
+    can hand it to TrialReporter.
+    """
+    logs_dir = Path("logs")
+    logs_dir.mkdir(exist_ok=True)
+    log_path   = logs_dir / f"{run_name}.log"
+    jsonl_path = logs_dir / f"{run_name}.jsonl"
+
     log = logging.getLogger("optuna_search")
     log.setLevel(logging.DEBUG)
     if log.handlers:
         log.handlers.clear()
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)-8s] %(message)s",
+    log.propagate = False
+
+    console_fmt = logging.Formatter("%(message)s")
+    file_fmt    = logging.Formatter(
+        "%(asctime)s [%(levelname)-5s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
+
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
-    ch.setFormatter(fmt)
-    fh = logging.FileHandler(f"logs/{run_name}.log", encoding="utf-8")
+    ch.setFormatter(console_fmt)
+    fh = logging.FileHandler(log_path, encoding="utf-8")
     fh.setLevel(logging.DEBUG)
-    fh.setFormatter(fmt)
+    fh.setFormatter(file_fmt)
     log.addHandler(ch)
     log.addHandler(fh)
-    return log
+    return log, log_path, jsonl_path
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact human duration: 47s, 3m12s, 11h22m."""
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s"
+
+
+class TrialReporter:
+    """Per-trial logging + JSONL emission + running best/ETA tracking.
+
+    `report(...)` is called once per completed trial. It:
+      • updates best-so-far and trial timing
+      • prints a single dense INFO line (console + file)
+      • appends a structured row to the JSONL file (machine-readable)
+    """
+
+    def __init__(self, log: logging.Logger, jsonl_path: Path, n_trials: int):
+        self.log = log
+        self.n_trials = n_trials
+        self.start = time.perf_counter()
+        self.best_score = float("-inf")
+        self.best_trial = -1
+        self.completed = 0
+        self.jsonl_path = jsonl_path
+        self._fh = open(jsonl_path, "a", encoding="utf-8")
+
+    def close(self) -> None:
+        try:
+            self._fh.close()
+        except Exception:
+            pass
+
+    def report(
+        self,
+        *,
+        trial_number: int,
+        params: dict,
+        score: float,
+        breakdown: dict,
+        oos: dict,
+        bt: dict,
+        wall_s: float,
+    ) -> None:
+        self.completed += 1
+        if score > self.best_score:
+            self.best_score = score
+            self.best_trial = trial_number
+
+        elapsed = time.perf_counter() - self.start
+        mean_t  = elapsed / max(1, self.completed)
+        eta     = (self.n_trials - self.completed) * mean_t
+
+        self.log.info(
+            f"[Trial {trial_number:>4}/{self.n_trials}] "
+            f"bar={params['bar_size']:>2}M "
+            f"pt/sl={params['pt_sl']:>7} "
+            f"span={params['span']:>2} "
+            f"hold={params['max_hold']:>4} "
+            f"cusum={params['cusum_h']:.4f} "
+            f"│ score={score:+.4f} "
+            f"(min_pr={breakdown['score_min_pr']:.2f} "
+            f"bal={breakdown['score_balance_gap']:.2f} "
+            f"over={breakdown['score_overfit_gap']:.2f} "
+            f"stab={breakdown['score_fold_f1_std']:.2f}) "
+            f"│ f1_l={oos['f1_long']:.2f} "
+            f"p={oos['prec_long']:.2f} "
+            f"r={oos['recall_long']:.2f} "
+            f"│ bt n={bt['n_trades']:>5} "
+            f"pnl={safe(bt['net_pnl_after_fees']):+.3f} "
+            f"sr={safe(bt['sharpe_trade_annualized']):+.2f} "
+            f"│ {_fmt_duration(wall_s):>6} "
+            f"ETA {_fmt_duration(eta):>6} "
+            f"★best={self.best_score:+.3f}(#{self.best_trial})"
+        )
+
+        rec = {
+            "trial":     int(trial_number),
+            "wall_s":    float(wall_s),
+            "elapsed_s": float(elapsed),
+            "params":    params,
+            "score":     float(score),
+            "breakdown": {k: float(v) for k, v in breakdown.items()},
+            "oos":       {k: float(v) for k, v in oos.items()},
+            "bt_real": {
+                "n_trades":         int(bt["n_trades"]),
+                "net_pnl":          safe(bt["net_pnl_after_fees"]),
+                "gross_pnl":        safe(bt["gross_pnl_net"]),
+                "win_rate":         safe(bt["win_rate_net"]),
+                "profit_factor":    safe(bt["profit_factor_net"]),
+                "mdd_log":          safe(bt["max_drawdown_log_net"]),
+                "sharpe_trade":     safe(bt["sharpe_trade_annualized"]),
+                "trades_per_year":  safe(bt["trades_per_year"]),
+            },
+            "best_so_far": {"score": self.best_score, "trial": self.best_trial},
+        }
+        self._fh.write(json.dumps(rec) + "\n")
+        self._fh.flush()
 
 
 def cusum_filter(close: pd.Series, h: float) -> pd.Index:
@@ -182,48 +347,28 @@ def cusum_filter(close: pd.Series, h: float) -> pd.Index:
 
 def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
     """
-    Compute the superset of features (6 indicators + extended set) on the FULL
-    contiguous bar sequence. Must be called BEFORE any CUSUM filtering so
-    rolling windows have no gaps. Returns a DataFrame with the same RangeIndex
-    as bars.
+    Compute the 6 indicator families (frac_diff + BB + RSI + MACD + ADX +
+    Stoch RSI) on the FULL contiguous bar sequence. Must be called BEFORE any
+    CUSUM filtering so rolling windows have no gaps.
 
-    Leakage note: every column produced here is causal — backward-rolling
-    windows, .shift(k>0), or bar-local values known at close. No future bars
-    are referenced.
+    Leakage note: every column is causal — backward-rolling windows,
+    .shift(k>0), or bar-local values known at close. No future bars referenced.
     """
     lr = log_returns(bars)
     log_price = pd.Series(np.log(bars["close"].to_numpy(dtype=np.float64)), index=bars.index)
     fd = frac_diff_ffd(log_price, d=1.0)  # placeholder: run_cv overrides per fold with ADF-selected d
 
-    # 6 indicator families
     bb_pct_b, bb_width = bollinger_bands(bars)
     rsi_val = rsi_feature(bars)
     macd_line, macd_sig, macd_hist = macd_features(bars)
     adx_val, adx_pdi, adx_mdi = adx_features(bars)
     stoch_k, stoch_d = stochastic_rsi(bars)
 
-    # Extended set (all causal)
-    atr = atr_norm(bars, period=14)
-    rv20 = realized_vol(bars, window=20)
-    roc5 = rate_of_change(bars, window=5)
-    roc20 = rate_of_change(bars, window=20)
-    d_sma20 = dist_to_sma(bars, window=20)
-    d_sma50 = dist_to_sma(bars, window=50)
-    hl_r = hl_range(bars)
-    co_r = co_range(bars)
-    br = buy_ratio(bars)
-    vz = volume_zscore(bars, window=50)
-    ti = trade_intensity(bars, window=50)
-    oema = ofi_ema(bars, span=10)
-    lags = lagged_log_returns(bars, lags=(1, 2))
-    cyc = cyclical_time_features(bars)
-
-    out = pd.DataFrame({
+    return pd.DataFrame({
         "open_time":    bars["open_time"].values,
         "close_time":   bars["close_time"].values,
         "close":        bars["close"].values,
         "log_return":   lr.values,
-        # 6 indicator families
         "frac_diff":    fd.values,
         "bb_pct_b":     bb_pct_b.values,
         "bb_width":     bb_width.values,
@@ -236,39 +381,18 @@ def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
         "adx_mdi":      adx_mdi.values,
         "stoch_rsi_k":  stoch_k.values,
         "stoch_rsi_d":  stoch_d.values,
-        # extended: microstructure
-        "ofi":              bars["ofi"].values,
-        "ofi_ema":          oema.values,
-        "buy_ratio":        br.values,
-        "vol_zscore":       vz.values,
-        "trade_intensity":  ti.values,
-        # extended: volatility / range
-        "atr_norm":         atr.values,
-        "realized_vol_20":  rv20.values,
-        "hl_range":         hl_r.values,
-        "co_range":         co_r.values,
-        # extended: momentum / mean-reversion
-        "roc_5":            roc5.values,
-        "roc_20":           roc20.values,
-        "dist_to_sma20":    d_sma20.values,
-        "dist_to_sma50":    d_sma50.values,
-        # extended: lagged returns
-        "log_return_lag1":  lags["log_return_lag1"].values,
-        "log_return_lag2":  lags["log_return_lag2"].values,
-        # extended: cyclical time
-        "hour_sin":         cyc["hour_sin"].values,
-        "hour_cos":         cyc["hour_cos"].values,
-        "dow_sin":          cyc["dow_sin"].values,
-        "dow_cos":          cyc["dow_cos"].values,
     }, index=pd.RangeIndex(len(bars)))
-    return out
 
 
-# ── Optuna Grid Search ──────────────────────────────────────────────────────────
+# ── Optuna TPE Search ──────────────────────────────────────────────────────────
 
-def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> float:
+def objective(
+    trial: optuna.Trial,
+    log: logging.Logger,
+    rf_params: dict,
+    reporter: "TrialReporter | None" = None,
+) -> float:
     t_trial = time.perf_counter()
-    features_set  = trial.suggest_categorical("features_set",  SEARCH_SPACE["features_set"])
     bar_size      = trial.suggest_categorical("bar_size",      SEARCH_SPACE["bar_size"])
     pt_sl_key     = trial.suggest_categorical("pt_sl",         SEARCH_SPACE["pt_sl"])
     cusum_h       = trial.suggest_categorical("cusum_h",       SEARCH_SPACE["cusum_h"])
@@ -277,7 +401,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     pt, sl = (float(x) for x in pt_sl_key.split("_"))
     tp_sl_key = pt_sl_key
 
-    active_features = FEATURE_SETS[features_set]
+    active_features = FEATURES_6_INDICATORS
     use_time_decay  = USE_TIME_DECAY_FIXED
     use_overlap     = USE_OVERLAP_FIXED
     time_decay_c    = 1.0  # no-op; kept to satisfy run_cv() signature
@@ -286,7 +410,7 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     max_hold = low + max_hold_slot * step
 
     log.debug(
-        f"Trial {trial.number:>6} | features={features_set}  bar={bar_size}M  pt/sl={tp_sl_key}"
+        f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
         f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
         f"  td={use_time_decay}  overlap={use_overlap}"
     )
@@ -316,7 +440,13 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
         cache_status = f"cache hit → {cache_path.name}"
     else:
         vol_aligned = vol_full.reindex(pd.DatetimeIndex(bars["close_time"])).ffill()
-        labels_full = label_bars(bars, vol_aligned, pt=pt, sl=sl, max_hold=max_hold)
+        # Capture label_bars' progress prints into DEBUG (file only); keep console clean.
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            labels_full = label_bars(bars, vol_aligned, pt=pt, sl=sl, max_hold=max_hold)
+        for _line in _buf.getvalue().splitlines():
+            if _line.strip():
+                log.debug(f"  label_bars: {_line}")
         labels_full.to_parquet(cache_path, index=False)
         cache_status = f"cached → {cache_path.name}"
     log.debug(
@@ -430,6 +560,16 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     # Net PnL: cumulative compounded return over OOS log returns (no fees).
     oos_net_pnl = safe(float(np.exp(np.nansum(np.asarray(strat_ret, dtype=float))) - 1.0))
 
+    # ── 9b. Realistic OOS backtest (non-overlap PT/SL exits + fees) ──
+    # `df` carries t1_time (gappy index after label-filter); rejoin onto oos_df.
+    oos_df_bt = oos_df.join(df[["t1_time"]], how="left")
+    bt_real = realistic_backtest(
+        y_pred=oos_df_bt["y_pred"].to_numpy(),
+        triple_barrier_log_ret=oos_df_bt["ret"].to_numpy(),
+        close_times=oos_df_bt["close_time"].to_numpy(),
+        t1_times=oos_df_bt["t1_time"].to_numpy(),
+    )
+
     oos_report = classification_report(
         oos_df["y_true"].to_numpy(),
         oos_df["y_pred"].to_numpy(),
@@ -452,8 +592,6 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     prec_long = safe(oos_report["long"]["precision"])
     prec_flat = safe(oos_report["flat"]["precision"])
 
-    trial.set_user_attr("features_count", len(active_features))
-    trial.set_user_attr("features_list", ",".join(active_features))
     trial.set_user_attr("oos_auc_pr", auc_pr)
     trial.set_user_attr("oos_sharpe", oos_sharpe)
     trial.set_user_attr("oos_net_pnl", oos_net_pnl)
@@ -468,40 +606,70 @@ def objective(trial: optuna.Trial, log: logging.Logger, rf_params: dict) -> floa
     trial.set_user_attr("max_hold", max_hold)
     trial.set_user_attr("n_bars", len(df))
     trial.set_user_attr("bar_size", bar_size)
-    trial.set_user_attr("pt", pt)
-    trial.set_user_attr("sl", sl)
     trial.set_user_attr("pt_sl", tp_sl_key)
-    trial.set_user_attr("use_cusum", True)
-    trial.set_user_attr("use_time_decay", use_time_decay)
-    trial.set_user_attr("symbol", SYMBOL)
     trial.set_user_attr("labels_cache_hit", labels_cache_hit)
 
-    # ── 10. Save model for this trial (all models saved — task req 8) ──
-    t_save = time.perf_counter()
-    Path("data/processed/models").mkdir(parents=True, exist_ok=True)
-    model_path = f"data/processed/models/trial_{trial.number:06d}_bar{bar_size}_{SYMBOL}.pkl"
-    train_final(
-        df, rf_params,
-        max_hold=max_hold,
-        feature_cols=active_features,
-        out_path=model_path,
-        time_decay_c=time_decay_c,
-        use_time_decay=use_time_decay,
-        use_overlap=use_overlap,
+    # ── Realistic non-overlap backtest user_attrs (fees + PT/SL exits) ──
+    trial.set_user_attr("oos_real_n_trades",        bt_real["n_trades"])
+    trial.set_user_attr("oos_real_net_pnl",         safe(bt_real["net_pnl_after_fees"]))
+    trial.set_user_attr("oos_real_gross_pnl",       safe(bt_real["gross_pnl_net"]))
+    trial.set_user_attr("oos_real_win_rate",        safe(bt_real["win_rate_net"]))
+    trial.set_user_attr("oos_real_profit_factor",   safe(bt_real["profit_factor_net"]))
+    trial.set_user_attr("oos_real_mdd_log",         safe(bt_real["max_drawdown_log_net"]))
+    trial.set_user_attr("oos_real_sharpe_trade",    safe(bt_real["sharpe_trade_annualized"]))
+    trial.set_user_attr("oos_real_trades_per_year", safe(bt_real["trades_per_year"]))
+    trial.set_user_attr("oos_real_round_trip_bps",  bt_real["round_trip_cost_bps"])
+    trial.set_user_attr("fee_bps_per_side",         FEE_BPS_PER_SIDE_DEFAULT)
+    trial.set_user_attr("slippage_bps_per_side",    SLIPPAGE_BPS_PER_SIDE_DEFAULT)
+
+    # ── 10. Composite score (TPE objective) ──
+    fold_train_accs = [fr["train_acc"] for fr in fold_results]
+    fold_test_accs  = [fr["accuracy"]  for fr in fold_results]
+    fold_f1_longs   = [fr["f1_long"]   for fr in fold_results]
+
+    score, score_breakdown = composite_score(
+        oos_prec_long   = prec_long,
+        oos_recall_long = recall_long,
+        oos_f1_long     = f1_long,
+        fold_train_accs = fold_train_accs,
+        fold_test_accs  = fold_test_accs,
+        fold_f1_longs   = fold_f1_longs,
     )
-    log.debug(f"Model saved → {model_path}  [{time.perf_counter()-t_save:.1f}s]")
+    for k, v in score_breakdown.items():
+        trial.set_user_attr(k, v)
+    trial.set_user_attr("composite_score", score)
 
     wall = time.perf_counter() - t_trial
-    log.info(
-        f"Trial {trial.number:>6} | features={features_set}  bar={bar_size}M  pt/sl={tp_sl_key}"
-        f" span={span}  hold={max_hold}  cusum_h={cusum_h}"
-        f"  td={use_time_decay}  td_c={time_decay_c}"
-        f" | sharpe={oos_sharpe:+.4f}  net_pnl={oos_net_pnl:+.4f}"
-        f"  f1_macro={macro_f1:.4f}  acc={accuracy:.4f}  f1_long={f1_long:.4f}"
-        f" prec_long={prec_long:.4f}  rec_long={recall_long:.4f}"
-        f"  | {wall:.0f}s"
-    )
-    return oos_sharpe
+    if reporter is not None:
+        reporter.report(
+            trial_number = trial.number,
+            params = {
+                "bar_size": bar_size,
+                "pt_sl":    tp_sl_key,
+                "span":     span,
+                "cusum_h":  cusum_h,
+                "max_hold": max_hold,
+            },
+            score     = score,
+            breakdown = score_breakdown,
+            oos = {
+                "f1_long":     f1_long,
+                "prec_long":   prec_long,
+                "recall_long": recall_long,
+                "sharpe":      oos_sharpe,
+                "net_pnl":     oos_net_pnl,
+                "auc_pr":      auc_pr,
+            },
+            bt = bt_real,
+            wall_s = wall,
+        )
+    else:
+        log.info(
+            f"[Trial {trial.number:>4}] score={score:+.4f}  bar={bar_size}M"
+            f"  pt/sl={tp_sl_key}  span={span}  hold={max_hold}  cusum={cusum_h}"
+            f"  | {wall:.0f}s"
+        )
+    return score
 
 
 def optuna_main(
@@ -520,74 +688,121 @@ def optuna_main(
     os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 
     run_name = f"optuna_{study_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    log = setup_logging(run_name)
+    log, log_path, jsonl_path = setup_logging(run_name)
+
+    # Silence Optuna's experimental-flag warnings (we know multivariate/group are experimental).
+    warnings.filterwarnings("ignore", category=optuna.exceptions.ExperimentalWarning)
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     cpu_count = os.cpu_count() or 1
     if rf_n_jobs is None:
         rf_n_jobs = max(1, cpu_count // max(1, optuna_n_jobs))
     rf_params_runtime = {**RF_PARAMS_FIXED, "n_jobs": rf_n_jobs}
 
-    log.info("=" * 72)
-    log.info(f"Optuna Grid Search (576-cell full grid)  —  {SYMBOL}")
-    log.info(f"Study: {study_name}  |  Trials: {n_trials:,}")
+    bar = "═" * 78
+    sub = "─" * 78
+    log.info(bar)
+    log.info(f"  OPTUNA TPE SEARCH  —  {SYMBOL}   ({datetime.now():%Y-%m-%d %H:%M:%S})")
+    log.info(bar)
+    log.info(f"  study:        {study_name}")
+    log.info(f"  trials:       {n_trials:,}   (space ≈ 84,000 cells)")
+    log.info(f"  sampler:      TPE  seed={sampler_seed}  n_startup_trials=50  multivariate=True  group=True")
+    log.info(f"  storage:      {storage or 'in-memory'}")
+    log.info(f"  parallel:     optuna_n_jobs={optuna_n_jobs}  rf_n_jobs={rf_n_jobs}  cpu={cpu_count}")
+    log.info(f"  log file:     {log_path}")
+    log.info(f"  jsonl file:   {jsonl_path}")
+    log.info(sub)
+    log.info(f"  search dims:")
+    log.info(f"    bar_size      ∈ {SEARCH_SPACE['bar_size']}")
+    log.info(f"    pt_sl         ∈ {SEARCH_SPACE['pt_sl']}")
+    log.info(f"    cusum_h       ∈ {SEARCH_SPACE['cusum_h']}")
+    log.info(f"    span          ∈ {SEARCH_SPACE['span']}")
+    log.info(f"    max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}")
+    log.info(sub)
     log.info(
-        f"features_set ∈ {SEARCH_SPACE['features_set']}  |  "
-        f"bar_size ∈ {SEARCH_SPACE['bar_size']}  |  "
-        f"pt_sl ∈ {SEARCH_SPACE['pt_sl']}"
+        f"  score = +{W_MIN_PR}·min(p,r)  -{W_BALANCE}·|p-r|  +{W_F1_LONG}·f1_long"
+        f"  -{W_OVERFIT}·overfit_gap  -{W_FOLD_STD}·std(fold_f1)"
     )
     log.info(
-        f"cusum_h ∈ {SEARCH_SPACE['cusum_h']}  |  "
-        f"span ∈ {SEARCH_SPACE['span']}  |  "
-        f"max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}"
+        f"  features:     6_indicators (12 cols, frac_diff + BB + RSI + MACD + ADX + Stoch RSI)"
     )
     log.info(
-        f"Fixed: use_time_decay={USE_TIME_DECAY_FIXED}  use_overlap={USE_OVERLAP_FIXED}  |  "
-        f"Binary long-vs-short labels (flat dropped)"
-    )
-    log.info(
-        f"RF: n_est={RF_PARAMS_FIXED['n_estimators']}  "
+        f"  RF:           n_est={RF_PARAMS_FIXED['n_estimators']}  "
         f"max_depth={RF_PARAMS_FIXED['max_depth']}  "
         f"min_samples_leaf={RF_PARAMS_FIXED['min_samples_leaf']}"
     )
-    log.info(
-        f"Parallel: optuna_n_jobs={optuna_n_jobs}"
-        f"  rf_n_jobs={rf_n_jobs}"
-        f"  cpu_count={cpu_count}"
-        f"  storage={storage or 'in-memory'}"
-    )
-    log.info("=" * 72)
-
-    optuna.logging.set_verbosity(optuna.logging.WARNING)
+    log.info(bar)
 
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
-        sampler=GridSampler(SEARCH_SPACE, seed=sampler_seed),
+        sampler=TPESampler(
+            seed=sampler_seed,
+            n_startup_trials=50,
+            multivariate=True,
+            group=True,
+        ),
         storage=storage,
         load_if_exists=True,
     )
 
+    reporter = TrialReporter(log, jsonl_path, n_trials)
     flow_start = time.perf_counter()
-
-    study.optimize(
-        lambda trial: objective(trial, log, rf_params_runtime),
-        n_trials=n_trials,
-        n_jobs=optuna_n_jobs,
-        show_progress_bar=True,
-    )
+    try:
+        study.optimize(
+            lambda trial: objective(trial, log, rf_params_runtime, reporter),
+            n_trials=n_trials,
+            n_jobs=optuna_n_jobs,
+            show_progress_bar=False,
+        )
+    finally:
+        reporter.close()
 
     total = time.perf_counter() - flow_start
 
-    log.info("=" * 72)
-    log.info(f"Search complete in {total / 60:.1f} min  ({int(total)}s)")
-    best = study.best_trial
-    log.info(f"Best trial #{best.number}  |  OOS Sharpe = {best.value:.4f}")
-    log.info(f"  Params  : {best.params}")
-    log.info(f"  Metrics : {best.user_attrs}")
+    # ── End-of-run summary ──
     out_csv = "optuna_trials.csv"
     study.trials_dataframe().to_csv(out_csv, index=False)
-    log.info(f"Trial history → {out_csv}  ({len(study.trials)} rows)")
-    log.info("=" * 72)
+
+    completed_trials = [t for t in study.trials if t.value is not None]
+    top = sorted(completed_trials, key=lambda t: t.value, reverse=True)[:5]
+
+    log.info(bar)
+    log.info(f"  SEARCH COMPLETE  —  {len(completed_trials)}/{n_trials} trials in {_fmt_duration(total)}")
+    log.info(bar)
+    if top:
+        best = top[0]
+        ua   = best.user_attrs
+        log.info(f"  ★ best: trial #{best.number}   composite_score = {best.value:+.4f}")
+        log.info(f"    params:   {best.params}")
+        log.info(
+            f"    OOS:      f1_long={ua.get('oos_f1_long', 0):.4f}  "
+            f"prec_long={ua.get('oos_prec_long', 0):.4f}  "
+            f"recall_long={ua.get('oos_recall_long', 0):.4f}  "
+            f"sharpe={ua.get('oos_sharpe', 0):+.4f}"
+        )
+        log.info(
+            f"    bt_real:  n_trades={ua.get('oos_real_n_trades', 0)}  "
+            f"net_pnl={ua.get('oos_real_net_pnl', 0):+.4f}  "
+            f"win_rate={ua.get('oos_real_win_rate', 0):.3f}  "
+            f"pf={ua.get('oos_real_profit_factor', 0):.3f}  "
+            f"sharpe_trade={ua.get('oos_real_sharpe_trade', 0):+.4f}"
+        )
+        log.info(sub)
+        log.info(f"  top 5 by composite_score:")
+        for t in top:
+            log.info(
+                f"    #{t.number:>5}  score={t.value:+.4f}  "
+                f"bar={t.params.get('bar_size'):>2}M  pt/sl={t.params.get('pt_sl'):>7}  "
+                f"span={t.params.get('span'):>2}  hold_slot={t.params.get('max_hold_slot'):>2}  "
+                f"cusum={t.params.get('cusum_h'):.4f}"
+            )
+    log.info(sub)
+    log.info(f"  outputs:")
+    log.info(f"    {log_path}        (full run log, DEBUG level)")
+    log.info(f"    {jsonl_path}      (per-trial JSONL)")
+    log.info(f"    {out_csv}         (Optuna trials dataframe)")
+    log.info(bar)
 
 
 if __name__ == "__main__":
