@@ -895,6 +895,11 @@ def optuna_main(
     )
     log.info(bar)
 
+    # load_if_exists=True so the 4 launch.py workers can share one study:
+    # the first to arrive creates it, the rest attach. To start a v2 run
+    # *fresh* (no resume), delete the study from optuna.db beforehand:
+    #   uv run python -c "import optuna; optuna.delete_study(\
+    #     study_name='solusdt_v2_scoring_fixed', storage='sqlite:///optuna.db')"
     study = optuna.create_study(
         direction="maximize",
         study_name=study_name,
@@ -905,17 +910,12 @@ def optuna_main(
             constant_liar=True,
         ),
         storage=storage,
-        load_if_exists=False,
+        load_if_exists=True,
     )
 
-    # ── Warm-start: seed the TPE with a known-good point from the v1 run.
-    # Only trial 18 from v1 fits the new search space (the others used
-    # bar_size 3/5 or cusum/span values now pruned out). Skip silently if
-    # the values somehow drift out of the current space.
     # Warm-start with v1 winners that still fit the (much smaller) v2 space.
-    # Each dict must contain every searched key. The filter below silently
-    # drops points whose values fall outside the new space. Trial 6's params
-    # were not logged, so it can't be enqueued.
+    # Only run the enqueue step when the study has no trials yet, so the
+    # 4 launch.py workers don't each append duplicate warm-start points.
     WARM_START_TRIALS = [
         # Trial 18 (v1):  bar=15 pt_sl=0.7_1.4 cusum=0.006 span=80 max_hold=300 (slot 2)
         {"bar_size": 15, "pt_sl": "0.7_1.4", "cusum_h": 0.006,
@@ -927,18 +927,27 @@ def optuna_main(
          "max_depth": 3, "min_samples_leaf": 50},
         # Trial 6 (v1):  params unknown — omitted intentionally.
     ]
-    enqueued, skipped = 0, []
-    for w in WARM_START_TRIALS:
-        bad = [k for k in w if w[k] not in SEARCH_SPACE[k]]
-        if bad:
-            skipped.append((w, bad))
-        else:
-            study.enqueue_trial(w)
-            enqueued += 1
-    log.info(f"  warm-start:   enqueued {enqueued}/{len(WARM_START_TRIALS)} v1-trial points "
-             f"({len(skipped)} skipped — keys out of v2 space)")
-    for w, bad in skipped:
-        log.debug(f"    skipped warm-start (out-of-space keys {bad}): {w}")
+    existing_trials = len(study.trials)
+    if existing_trials == 0:
+        enqueued, skipped = 0, []
+        for w in WARM_START_TRIALS:
+            bad = [k for k in w if w[k] not in SEARCH_SPACE[k]]
+            if bad:
+                skipped.append((w, bad))
+            else:
+                study.enqueue_trial(w)
+                enqueued += 1
+        log.info(
+            f"  warm-start:   leader enqueued {enqueued}/{len(WARM_START_TRIALS)} "
+            f"v1-trial points ({len(skipped)} skipped — keys out of v2 space)"
+        )
+        for w, bad in skipped:
+            log.debug(f"    skipped warm-start (out-of-space keys {bad}): {w}")
+    else:
+        log.info(
+            f"  warm-start:   skipped — joining study with {existing_trials} "
+            f"existing trial(s)"
+        )
     log.info(bar)
 
     reporter = TrialReporter(log, jsonl_path, n_trials)
