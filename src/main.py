@@ -84,28 +84,25 @@ USE_TIME_DECAY_FIXED: bool = False
 USE_OVERLAP_FIXED: bool = False
 
 SEARCH_SPACE: dict[str, list] = {
-    "bar_size":      [3, 5, 15, 25],                                                 # 4
-    "pt_sl":         [
-        # symmetric (9)
-        "0.5_0.5",
-        "0.6_0.6", "0.7_0.7", "0.8_0.8", "0.9_0.9", "1.0_1.0",
-        "1.1_1.1", "1.2_1.2", "1.3_1.3",
-        # asymmetric (5)
-        "0.8_1.2", "1.2_0.8", "1.0_1.5", "1.5_1.0", "0.7_1.4",
-    ],                                                                               # 14
-    "cusum_h":       [
-        0.0015, 0.002, 0.0025, 0.003, 0.0035,
-        0.004, 0.0045, 0.005, 0.0055, 0.006,
-        0.0065, 0.007, 0.0075, 0.008, 0.009,
-    ],                                                                               # 15
-    "span":          [10, 15, 20, 25, 30, 35, 40, 50, 60, 80],                       # 10
-    "max_hold_slot": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10],                                # 10
+    # v2 — bar 3/5 dropped (over-trading); pt_sl restricted to TP≤SL configs +
+    # mid symmetric (extreme symmetrics dropped); cusum/span/hold trimmed to
+    # mid-range. class_weight removed from search and fixed at "balanced".
+    "bar_size":          [15, 25],                                                   # 2
+    "pt_sl":             [
+        "0.7_0.7", "0.9_0.9", "1.0_1.0", "1.2_1.2",  # mid symmetric
+        "0.7_1.4", "0.8_1.2", "1.0_1.5",             # TP<SL asymmetric (v1 winners)
+    ],                                                                               # 7
+    "cusum_h":           [0.0035, 0.004, 0.005, 0.006, 0.007],                       # 5
+    "span":              [30, 50, 80],                                               # 3
+    "max_hold_slot":     [3, 5, 7],                                                  # 3
+    "max_depth":         [3, 5],                                                     # 2 — probability calibration
+    "min_samples_leaf":  [20, 50],                                                   # 2 — flexibility
 }
 
-# Theoretical space: 4 × 14 × 15 × 10 × 10 = 84,000 combos. TPE samples N_TRIALS.
-N_TRIALS: int = 1000
+# Theoretical space: 2 × 7 × 5 × 3 × 3 × 2 × 2 = 2,520 cells. TPE samples N_TRIALS.
+N_TRIALS: int = 400
 
-STUDY_NAME = "dollar_bar_tpe_v1"
+STUDY_NAME = "solusdt_v2_scoring_fixed"
 
 TEST_RATIO: float = 0.20
 
@@ -125,64 +122,174 @@ def safe(v: float) -> float:
     return float(v)
 
 
-# ── Composite score weights ─────────────────────────────────────────────────
-# Optimizes for: OOS long-side precision AND recall BOTH high AND balanced,
-# with strong overfit penalty and per-fold f1_long stability penalty.
-# No Sharpe / backtest term in the score (kept as user_attrs for inspection).
-W_MIN_PR:   float = 1.5   # min(prec_long, recall_long)            [0, 1] — both must be high
-W_BALANCE:  float = 1.0   # |prec_long - recall_long|              [0, 1] — punishes asymmetry
-W_F1_LONG:  float = 0.5   # OOS f1_long                            [0, 1] — smooth tiebreaker
-W_OVERFIT:  float = 5.0   # max(0, mean(train_acc) - mean(test_acc))  typ. [0, 0.3] — heavy penalty
-W_FOLD_STD: float = 1.0   # std of per-fold f1_long                typ. [0, 0.3] — stability
+def get_label_share(pt_sl_str: str) -> float:
+    """Brownian-motion baseline P(TP hit first under a driftless random walk).
+
+    With PT = pt·σ above and SL = sl·σ below the entry, optional-stopping on a
+    Brownian motion gives  P(TP first) = sl / (pt + sl).  This is the prior
+    probability of the +1 (long) label *before* the model sees any features,
+    so it's the right baseline for both `precision_long` and `auc_pr`:
+    a no-skill classifier sits at precision ≈ label_share, AUC-PR ≈ label_share.
+    """
+    tp, sl = (float(x) for x in pt_sl_str.split("_"))
+    return sl / (tp + sl)
+
+
+# ── Scoring v2 weights & hard-filter thresholds ────────────────────────────
+# Rewards: AUC-PR edge above the Brownian baseline (signal), precision edge
+# (selectivity), pf near break-even. Penalises: bad trade frequency, train/test
+# gap, fold instability. Hard filter prunes degenerate trials.
+W_SIGNAL:    float = 1.5   # signal_score = max(0, auc_edge * 5)         (edge vs label_share)
+W_SELECT:    float = 1.0   # selectivity_score = max(0, precision_edge * 10)
+W_PF:        float = 0.5   # pf_score = clip((pf - 0.7)/0.3, 0, 1.5)
+W_FREQ:      float = 0.8   # freq_penalty: optimal 500–3000 trades/year
+W_OVERFIT:   float = 1.5   # overfit_penalty = max(0, train_acc - test_acc) * 10
+W_STABILITY: float = 0.5   # stability_penalty = max(0, fold_f1_std - 0.10) * 2
+
+PRUNE_RECALL_LO:    float = 0.15    # trivial flat
+PRUNE_RECALL_HI:    float = 0.90    # trivial long
+PRUNE_EDGE_LO:      float = -0.02   # prune if prec_long < label_share + (-0.02)
+PRUNE_AUC_EDGE_LO:  float = -0.01   # prune if auc_pr   < label_share + (-0.01)
+PRUNE_MIN_TRADES:   int   = 100     # statistically meaningless
+
+
+def _signal_score(auc_pr: float, baseline: float) -> float:
+    """AUC-PR edge above the random-classifier baseline (= positive prevalence).
+    0.08 edge → 0.40 score."""
+    return max(0.0, (auc_pr - baseline) * 5.0)
+
+def _selectivity_score(prec_long: float, baseline: float) -> float:
+    """Precision edge above the Brownian baseline. 0.05 edge → 0.50 score."""
+    return max(0.0, (prec_long - baseline) * 10.0)
+
+def _pf_score(pf: float) -> float:
+    if not math.isfinite(pf):
+        return 0.0
+    return min(1.5, max(0.0, (pf - 0.7) / 0.3))
+
+def _freq_penalty(trades_per_year: float) -> float:
+    tpy = safe(trades_per_year)
+    if 500.0 <= tpy <= 3000.0:
+        return 0.0
+    if tpy < 500.0:
+        return min(1.0, (500.0 - tpy) / 300.0)
+    return min(1.5, (tpy - 3000.0) / 2000.0)
+
+def _overfit_penalty(train_acc_mean: float, test_acc_mean: float) -> float:
+    return max(0.0, train_acc_mean - test_acc_mean) * 10.0
+
+def _stability_penalty(fold_f1_std: float) -> float:
+    return max(0.0, fold_f1_std - 0.10) * 2.0
 
 
 def composite_score(
-    oos_prec_long: float,
-    oos_recall_long: float,
-    oos_f1_long: float,
+    pt_sl: str,
+    auc_pr: float,
+    prec_long: float,
+    recall_long: float,
+    profit_factor: float,
+    trades_per_year: float,
+    n_trades: int,
     fold_train_accs: list[float],
     fold_test_accs: list[float],
     fold_f1_longs: list[float],
-) -> tuple[float, dict]:
-    """Weighted-sum score that rewards configurations where OOS long-class
-    precision and recall are both high *and* balanced, while penalising
-    train/test overfit gap and per-fold f1_long instability.
+) -> tuple[float | None, dict, str | None]:
+    """Scoring v2 — calibrated against the per-trial Brownian baseline.
 
-    Components (signed):
-        + W_MIN_PR  * min(prec_long, recall_long)         — both high
-        - W_BALANCE * |prec_long - recall_long|           — balanced
-        + W_F1_LONG * f1_long                             — smoothing
-        - W_OVERFIT * max(0, mean(train_acc)-mean(test_acc))  — generalization
-        - W_FOLD_STD* std(fold_f1_longs)                  — stability
+    The +1 (long) label prevalence depends on the pt_sl ratio:
+        label_share = sl / (pt + sl)
+    A no-skill classifier hits precision ≈ label_share and AUC-PR ≈ label_share.
+    We score the *edge* above that baseline, so e.g. precision = 0.66 on a
+    pt_sl="0.7_1.4" trial (baseline = 0.667) is worth ~0, while the same
+    precision on pt_sl="1.0_1.0" (baseline = 0.50) is worth +0.16 of edge.
+
+    Returns ``(score, breakdown, prune_reason)``.
+      - If ``prune_reason`` is not ``None``, the caller MUST raise
+        ``optuna.TrialPruned(prune_reason)``; ``score`` will be ``None``.
+
+    Components:
+        + W_SIGNAL    * max(0, auc_edge * 5)        ← auc_pr  − label_share
+        + W_SELECT    * max(0, precision_edge * 10) ← prec_long − label_share
+        + W_PF        * clip((pf − 0.7)/0.3, 0, 1.5)
+        - W_FREQ      * freq_penalty                ← optimal 500–3000 tpy
+        - W_OVERFIT   * (train_acc − test_acc) * 10
+        - W_STABILITY * max(0, std(fold f1) − 0.10) * 2
+
+    Hard filter (edge-based; baseline = label_share):
+        recall_long  ∉ [0.15, 0.90]                       trivial flat / trivial long
+        prec_long    < label_share + PRUNE_EDGE_LO        below precision baseline
+        auc_pr       < label_share + PRUNE_AUC_EDGE_LO    below AUC-PR baseline
+        n_trades     < 100                                statistically meaningless
     """
-    prec_long   = safe(oos_prec_long)
-    recall_long = safe(oos_recall_long)
-    f1_long     = safe(oos_f1_long)
-    min_pr      = min(prec_long, recall_long)
-    balance_gap = abs(prec_long - recall_long)
-    overfit_gap = max(
-        0.0,
-        float(np.mean(fold_train_accs)) - float(np.mean(fold_test_accs)),
+    prec_long_s   = safe(prec_long)
+    recall_long_s = safe(recall_long)
+    auc_pr_s      = safe(auc_pr)
+    pf_raw        = float(profit_factor) if profit_factor is not None else float("nan")
+    tpy           = safe(trades_per_year)
+    n_trades      = int(n_trades)
+    label_share   = get_label_share(pt_sl)        # per-trial Brownian baseline
+
+    # ── Hard filter (edge-based against per-trial baseline) ──
+    if recall_long_s < PRUNE_RECALL_LO:
+        return None, {}, f"recall_long={recall_long_s:.3f} < {PRUNE_RECALL_LO}"
+    if recall_long_s > PRUNE_RECALL_HI:
+        return None, {}, f"recall_long={recall_long_s:.3f} > {PRUNE_RECALL_HI}"
+    prec_floor = label_share + PRUNE_EDGE_LO
+    if prec_long_s < prec_floor:
+        return None, {}, (
+            f"prec_long={prec_long_s:.3f} < label_share+edge_lo={prec_floor:.3f} "
+            f"(label_share={label_share:.3f})"
+        )
+    auc_floor = label_share + PRUNE_AUC_EDGE_LO
+    if auc_pr_s < auc_floor:
+        return None, {}, (
+            f"auc_pr={auc_pr_s:.3f} < label_share+auc_edge_lo={auc_floor:.3f} "
+            f"(label_share={label_share:.3f})"
+        )
+    if n_trades < PRUNE_MIN_TRADES:
+        return None, {}, f"n_trades={n_trades} < {PRUNE_MIN_TRADES}"
+
+    # ── Components (edge-based) ──
+    precision_edge = prec_long_s - label_share
+    auc_edge       = auc_pr_s    - label_share
+    signal      = _signal_score(auc_pr_s, label_share)
+    selectivity = _selectivity_score(prec_long_s, label_share)
+    pf_s        = _pf_score(pf_raw)
+    freq_pen    = _freq_penalty(tpy)
+    overfit_pen = _overfit_penalty(
+        float(np.mean(fold_train_accs)) if fold_train_accs else 0.0,
+        float(np.mean(fold_test_accs))  if fold_test_accs  else 0.0,
     )
     fold_std    = float(np.std(fold_f1_longs, ddof=0)) if len(fold_f1_longs) > 1 else 0.0
+    stab_pen    = _stability_penalty(fold_std)
+
     score = (
-        W_MIN_PR    * min_pr
-        - W_BALANCE * balance_gap
-        + W_F1_LONG * f1_long
-        - W_OVERFIT * overfit_gap
-        - W_FOLD_STD* fold_std
+        + W_SIGNAL     * signal
+        + W_SELECT     * selectivity
+        + W_PF         * pf_s
+        - W_FREQ       * freq_pen
+        - W_OVERFIT    * overfit_pen
+        - W_STABILITY  * stab_pen
     )
     breakdown = {
-        "score_prec_long":     prec_long,
-        "score_recall_long":   recall_long,
-        "score_f1_long":       f1_long,
-        "score_min_pr":        min_pr,
-        "score_balance_gap":   balance_gap,
-        "score_overfit_gap":   overfit_gap,
-        "score_fold_f1_std":   fold_std,
-        "score_total":         float(score),
+        "label_share":       label_share,
+        "precision_edge":    precision_edge,
+        "auc_edge":          auc_edge,
+        "signal_score":      signal,
+        "selectivity_score": selectivity,
+        "pf_score":          pf_s,
+        "freq_penalty":      freq_pen,
+        "overfit_penalty":   overfit_pen,
+        "stability_penalty": stab_pen,
+        "fold_f1_std":       fold_std,
+        "auc_pr":            auc_pr_s,
+        "prec_long":         prec_long_s,
+        "recall_long":       recall_long_s,
+        "profit_factor":     pf_raw if math.isfinite(pf_raw) else 0.0,
+        "trades_per_year":   tpy,
+        "score_total":       float(score),
     }
-    return float(score), breakdown
+    return float(score), breakdown, None
 
 
 def setup_logging(run_name: str) -> tuple[logging.Logger, Path, Path]:
@@ -290,16 +397,19 @@ class TrialReporter:
             f"hold={params['max_hold']:>4} "
             f"cusum={params['cusum_h']:.4f} "
             f"│ score={score:+.4f} "
-            f"(min_pr={breakdown['score_min_pr']:.2f} "
-            f"bal={breakdown['score_balance_gap']:.2f} "
-            f"over={breakdown['score_overfit_gap']:.2f} "
-            f"stab={breakdown['score_fold_f1_std']:.2f}) "
-            f"│ f1_l={oos['f1_long']:.2f} "
+            f"(sig={breakdown['signal_score']:.2f} "
+            f"sel={breakdown['selectivity_score']:.2f} "
+            f"pf={breakdown['pf_score']:.2f} "
+            f"freq={breakdown['freq_penalty']:.2f} "
+            f"over={breakdown['overfit_penalty']:.2f} "
+            f"stab={breakdown['stability_penalty']:.2f}) "
+            f"│ aucpr={oos['auc_pr']:.2f} "
             f"p={oos['prec_long']:.2f} "
             f"r={oos['recall_long']:.2f} "
             f"│ bt n={bt['n_trades']:>5} "
             f"pnl={safe(bt['net_pnl_after_fees']):+.3f} "
-            f"sr={safe(bt['sharpe_trade_annualized']):+.2f} "
+            f"pf={safe(bt['profit_factor_net']):.2f} "
+            f"tpy={safe(bt['trades_per_year']):.0f} "
             f"│ {_fmt_duration(wall_s):>6} "
             f"ETA {_fmt_duration(eta):>6} "
             f"★best={self.best_score:+.3f}(#{self.best_trial})"
@@ -393,11 +503,13 @@ def objective(
     reporter: "TrialReporter | None" = None,
 ) -> float:
     t_trial = time.perf_counter()
-    bar_size      = trial.suggest_categorical("bar_size",      SEARCH_SPACE["bar_size"])
-    pt_sl_key     = trial.suggest_categorical("pt_sl",         SEARCH_SPACE["pt_sl"])
-    cusum_h       = trial.suggest_categorical("cusum_h",       SEARCH_SPACE["cusum_h"])
-    span          = trial.suggest_categorical("span",          SEARCH_SPACE["span"])
-    max_hold_slot = trial.suggest_categorical("max_hold_slot", SEARCH_SPACE["max_hold_slot"])
+    bar_size         = trial.suggest_categorical("bar_size",         SEARCH_SPACE["bar_size"])
+    pt_sl_key        = trial.suggest_categorical("pt_sl",            SEARCH_SPACE["pt_sl"])
+    cusum_h          = trial.suggest_categorical("cusum_h",          SEARCH_SPACE["cusum_h"])
+    span             = trial.suggest_categorical("span",             SEARCH_SPACE["span"])
+    max_hold_slot    = trial.suggest_categorical("max_hold_slot",    SEARCH_SPACE["max_hold_slot"])
+    max_depth        = trial.suggest_categorical("max_depth",        SEARCH_SPACE["max_depth"])
+    min_samples_leaf = trial.suggest_categorical("min_samples_leaf", SEARCH_SPACE["min_samples_leaf"])
     pt, sl = (float(x) for x in pt_sl_key.split("_"))
     tp_sl_key = pt_sl_key
 
@@ -409,9 +521,18 @@ def objective(
     low, _, step = MAX_HOLD_RANGES[bar_size]
     max_hold = low + max_hold_slot * step
 
+    # Per-trial RF params: start from the baseline (n_jobs, class_weight,
+    # n_estimators, random_state) and override the two searched RF dims.
+    rf_params_trial = {
+        **rf_params,
+        "max_depth":        max_depth,
+        "min_samples_leaf": min_samples_leaf,
+    }
+
     log.debug(
         f"Trial {trial.number:>6} | bar={bar_size}M  pt/sl={tp_sl_key}"
         f"  span={span}  hold={max_hold}  cusum_h={cusum_h}"
+        f"  depth={max_depth}  leaf={min_samples_leaf}"
         f"  td={use_time_decay}  overlap={use_overlap}"
     )
 
@@ -483,7 +604,7 @@ def objective(
     _, oos_df, fold_data = run_cv(
         df,
         max_hold=max_hold,
-        rf_params=rf_params,
+        rf_params=rf_params_trial,
         feature_cols=active_features,
         time_decay_c=time_decay_c,
         use_time_decay=use_time_decay,
@@ -622,19 +743,39 @@ def objective(
     trial.set_user_attr("fee_bps_per_side",         FEE_BPS_PER_SIDE_DEFAULT)
     trial.set_user_attr("slippage_bps_per_side",    SLIPPAGE_BPS_PER_SIDE_DEFAULT)
 
-    # ── 10. Composite score (TPE objective) ──
+    # ── 10. Composite score v2 (+ hard filter / TrialPruned) ──
     fold_train_accs = [fr["train_acc"] for fr in fold_results]
     fold_test_accs  = [fr["accuracy"]  for fr in fold_results]
     fold_f1_longs   = [fr["f1_long"]   for fr in fold_results]
 
-    score, score_breakdown = composite_score(
-        oos_prec_long   = prec_long,
-        oos_recall_long = recall_long,
-        oos_f1_long     = f1_long,
+    score, score_breakdown, prune_reason = composite_score(
+        pt_sl           = tp_sl_key,
+        auc_pr          = auc_pr,
+        prec_long       = prec_long,
+        recall_long     = recall_long,
+        profit_factor   = bt_real["profit_factor_net"],
+        trades_per_year = bt_real["trades_per_year"],
+        n_trades        = int(bt_real["n_trades"]),
         fold_train_accs = fold_train_accs,
         fold_test_accs  = fold_test_accs,
         fold_f1_longs   = fold_f1_longs,
     )
+
+    if prune_reason is not None:
+        # Record reason on the trial so it's visible in the DB / CSV, then prune.
+        trial.set_user_attr("prune_reason",   prune_reason)
+        trial.set_user_attr("oos_prec_long",  prec_long)
+        trial.set_user_attr("oos_recall_long",recall_long)
+        trial.set_user_attr("oos_auc_pr",     auc_pr)
+        trial.set_user_attr("oos_real_n_trades", int(bt_real["n_trades"]))
+        wall_prune = time.perf_counter() - t_trial
+        log.info(
+            f"[Trial {trial.number:>4}] PRUNED  ({prune_reason})  "
+            f"bar={bar_size}M  pt/sl={tp_sl_key}  span={span}  "
+            f"hold={max_hold}  cusum={cusum_h}  | {wall_prune:.0f}s"
+        )
+        raise optuna.TrialPruned(prune_reason)
+
     for k, v in score_breakdown.items():
         trial.set_user_attr(k, v)
     trial.set_user_attr("composite_score", score)
@@ -644,11 +785,13 @@ def objective(
         reporter.report(
             trial_number = trial.number,
             params = {
-                "bar_size": bar_size,
-                "pt_sl":    tp_sl_key,
-                "span":     span,
-                "cusum_h":  cusum_h,
-                "max_hold": max_hold,
+                "bar_size":         bar_size,
+                "pt_sl":            tp_sl_key,
+                "span":             span,
+                "cusum_h":          cusum_h,
+                "max_hold":         max_hold,
+                "max_depth":        max_depth,
+                "min_samples_leaf": min_samples_leaf,
             },
             score     = score,
             breakdown = score_breakdown,
@@ -701,35 +844,54 @@ def optuna_main(
 
     bar = "═" * 78
     sub = "─" * 78
+    space_size = 1
+    for v in SEARCH_SPACE.values():
+        space_size *= len(v)
     log.info(bar)
-    log.info(f"  OPTUNA TPE SEARCH  —  {SYMBOL}   ({datetime.now():%Y-%m-%d %H:%M:%S})")
+    log.info(f"  OPTUNA TPE SEARCH v2 — {SYMBOL}   ({datetime.now():%Y-%m-%d %H:%M:%S})")
     log.info(bar)
     log.info(f"  study:        {study_name}")
-    log.info(f"  trials:       {n_trials:,}   (space ≈ 84,000 cells)")
-    log.info(f"  sampler:      TPE  seed={sampler_seed}  n_startup_trials=50  multivariate=True  group=True")
-    log.info(f"  storage:      {storage or 'in-memory'}")
+    log.info(f"  trials:       {n_trials:,}   (space = {space_size:,} cells)")
+    log.info(f"  sampler:      TPE  seed={sampler_seed}  n_startup_trials=50  multivariate=True  constant_liar=True")
+    log.info(f"  storage:      {storage or 'in-memory'}   (load_if_exists=False)")
     log.info(f"  parallel:     optuna_n_jobs={optuna_n_jobs}  rf_n_jobs={rf_n_jobs}  cpu={cpu_count}")
     log.info(f"  log file:     {log_path}")
     log.info(f"  jsonl file:   {jsonl_path}")
     log.info(sub)
     log.info(f"  search dims:")
-    log.info(f"    bar_size      ∈ {SEARCH_SPACE['bar_size']}")
-    log.info(f"    pt_sl         ∈ {SEARCH_SPACE['pt_sl']}")
-    log.info(f"    cusum_h       ∈ {SEARCH_SPACE['cusum_h']}")
-    log.info(f"    span          ∈ {SEARCH_SPACE['span']}")
-    log.info(f"    max_hold_slot ∈ {SEARCH_SPACE['max_hold_slot']}")
+    log.info(f"    bar_size         ∈ {SEARCH_SPACE['bar_size']}")
+    log.info(f"    pt_sl            ∈ {SEARCH_SPACE['pt_sl']}")
+    log.info(f"    cusum_h          ∈ {SEARCH_SPACE['cusum_h']}")
+    log.info(f"    span             ∈ {SEARCH_SPACE['span']}")
+    log.info(f"    max_hold_slot    ∈ {SEARCH_SPACE['max_hold_slot']}")
+    log.info(f"    max_depth        ∈ {SEARCH_SPACE['max_depth']}")
+    log.info(f"    min_samples_leaf ∈ {SEARCH_SPACE['min_samples_leaf']}")
     log.info(sub)
     log.info(
-        f"  score = +{W_MIN_PR}·min(p,r)  -{W_BALANCE}·|p-r|  +{W_F1_LONG}·f1_long"
-        f"  -{W_OVERFIT}·overfit_gap  -{W_FOLD_STD}·std(fold_f1)"
+        f"  score = +{W_SIGNAL}·signal +{W_SELECT}·selectivity +{W_PF}·pf "
+        f"-{W_FREQ}·freq -{W_OVERFIT}·overfit -{W_STABILITY}·stability"
+    )
+    log.info(
+        f"  baseline:     label_share = sl/(tp+sl) — signal/selectivity scored "
+        f"as EDGE above this per-trial Brownian prior"
+    )
+    log.info(
+        f"  hard filter (TrialPruned, baseline = sl/(pt+sl)):"
+    )
+    log.info(
+        f"    recall_long ∉ [{PRUNE_RECALL_LO}, {PRUNE_RECALL_HI}]  │  "
+        f"prec_long < baseline + ({PRUNE_EDGE_LO})  │  "
+        f"auc_pr < baseline + ({PRUNE_AUC_EDGE_LO})  │  "
+        f"n_trades < {PRUNE_MIN_TRADES}"
     )
     log.info(
         f"  features:     6_indicators (12 cols, frac_diff + BB + RSI + MACD + ADX + Stoch RSI)"
     )
     log.info(
-        f"  RF:           n_est={RF_PARAMS_FIXED['n_estimators']}  "
-        f"max_depth={RF_PARAMS_FIXED['max_depth']}  "
-        f"min_samples_leaf={RF_PARAMS_FIXED['min_samples_leaf']}"
+        f"  RF base:      n_est={RF_PARAMS_FIXED['n_estimators']}  "
+        f"class_weight={RF_PARAMS_FIXED['class_weight']}  "
+        f"random_state={RF_PARAMS_FIXED['random_state']}  "
+        f"(max_depth / min_samples_leaf are searched)"
     )
     log.info(bar)
 
@@ -740,11 +902,44 @@ def optuna_main(
             seed=sampler_seed,
             n_startup_trials=50,
             multivariate=True,
-            group=True,
+            constant_liar=True,
         ),
         storage=storage,
-        load_if_exists=True,
+        load_if_exists=False,
     )
+
+    # ── Warm-start: seed the TPE with a known-good point from the v1 run.
+    # Only trial 18 from v1 fits the new search space (the others used
+    # bar_size 3/5 or cusum/span values now pruned out). Skip silently if
+    # the values somehow drift out of the current space.
+    # Warm-start with v1 winners that still fit the (much smaller) v2 space.
+    # Each dict must contain every searched key. The filter below silently
+    # drops points whose values fall outside the new space. Trial 6's params
+    # were not logged, so it can't be enqueued.
+    WARM_START_TRIALS = [
+        # Trial 18 (v1):  bar=15 pt_sl=0.7_1.4 cusum=0.006 span=80 max_hold=300 (slot 2)
+        {"bar_size": 15, "pt_sl": "0.7_1.4", "cusum_h": 0.006,
+         "span": 80, "max_hold_slot": 2,
+         "max_depth": 3, "min_samples_leaf": 50},
+        # Trial 30 (v1):  bar=25 pt_sl=0.8_1.2 cusum=0.0015 span=50 max_hold=540 (slot 8)
+        {"bar_size": 25, "pt_sl": "0.8_1.2", "cusum_h": 0.0015,
+         "span": 50, "max_hold_slot": 8,
+         "max_depth": 3, "min_samples_leaf": 50},
+        # Trial 6 (v1):  params unknown — omitted intentionally.
+    ]
+    enqueued, skipped = 0, []
+    for w in WARM_START_TRIALS:
+        bad = [k for k in w if w[k] not in SEARCH_SPACE[k]]
+        if bad:
+            skipped.append((w, bad))
+        else:
+            study.enqueue_trial(w)
+            enqueued += 1
+    log.info(f"  warm-start:   enqueued {enqueued}/{len(WARM_START_TRIALS)} v1-trial points "
+             f"({len(skipped)} skipped — keys out of v2 space)")
+    for w, bad in skipped:
+        log.debug(f"    skipped warm-start (out-of-space keys {bad}): {w}")
+    log.info(bar)
 
     reporter = TrialReporter(log, jsonl_path, n_trials)
     flow_start = time.perf_counter()
