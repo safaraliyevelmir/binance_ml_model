@@ -853,7 +853,7 @@ def optuna_main(
     log.info(f"  study:        {study_name}")
     log.info(f"  trials:       {n_trials:,}   (space = {space_size:,} cells)")
     log.info(f"  sampler:      TPE  seed={sampler_seed}  n_startup_trials=50  multivariate=True  constant_liar=True")
-    log.info(f"  storage:      {storage or 'in-memory'}   (load_if_exists=False)")
+    log.info(f"  storage:      {storage or 'in-memory'}   (load_if_exists=True — workers share)")
     log.info(f"  parallel:     optuna_n_jobs={optuna_n_jobs}  rf_n_jobs={rf_n_jobs}  cpu={cpu_count}")
     log.info(f"  log file:     {log_path}")
     log.info(f"  jsonl file:   {jsonl_path}")
