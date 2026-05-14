@@ -8,11 +8,15 @@ import warnings
 from datetime import datetime
 from pathlib import Path
 
+import joblib
 import numpy as np
 import optuna
 import pandas as pd
 from optuna.samplers import TPESampler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.isotonic import IsotonicRegression
 from sklearn.metrics import classification_report, precision_recall_curve, auc
+from sklearn.model_selection import KFold
 
 from src.features.engineer import (
     adx_features,
@@ -456,14 +460,6 @@ def cusum_filter(close: pd.Series, h: float) -> pd.Index:
 
 
 def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute the 6 indicator families (frac_diff + BB + RSI + MACD + ADX +
-    Stoch RSI) on the FULL contiguous bar sequence. Must be called BEFORE any
-    CUSUM filtering so rolling windows have no gaps.
-
-    Leakage note: every column is causal — backward-rolling windows,
-    .shift(k>0), or bar-local values known at close. No future bars referenced.
-    """
     lr = log_returns(bars)
     log_price = pd.Series(np.log(bars["close"].to_numpy(dtype=np.float64)), index=bars.index)
     fd = frac_diff_ffd(log_price, d=1.0)  # placeholder: run_cv overrides per fold with ADF-selected d
@@ -492,6 +488,240 @@ def compute_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
         "stoch_rsi_k":  stoch_k.values,
         "stoch_rsi_d":  stoch_d.values,
     }, index=pd.RangeIndex(len(bars)))
+
+
+def compute_lagged_bar_features(bars: pd.DataFrame) -> pd.DataFrame:
+    """V2 lag: shift(1) all feature cols so decision at bar t uses bars[..t-1] only.
+
+    Keeps open_time, close_time, close UNshifted as identifiers/join keys.
+    No-lag policy: time-of-day features stay current (not in this 12-indicator set).
+    """
+    raw = compute_bar_features(bars)
+    NO_LAG = {"open_time", "close_time", "close"}
+    for col in raw.columns:
+        if col not in NO_LAG:
+            raw[col] = raw[col].shift(1)
+    return raw
+
+
+# ── Primary Batch Training (train_batch CLI mode) ──────────────────────────────
+
+def isotonic_cv_calibrate(cv_oos: pd.DataFrame, n_splits: int = 5) -> tuple[IsotonicRegression, pd.DataFrame]:
+    """5-fold chronological isotonic calibration inside cv_oos (no self-fit bias).
+    Returns the calibrator fitted on FULL cv_oos (for test-time use) + cv_oos
+    with proba_1 replaced by cross-validated calibrated values.
+    """
+    if "proba_1" not in cv_oos.columns:
+        raise ValueError("cv_oos must have a 'proba_1' column")
+
+    cv_oos = cv_oos.sort_values("close_time").reset_index(drop=True).copy()
+    cv_oos["proba_1_raw"] = cv_oos["proba_1"].values
+
+    p_raw = cv_oos["proba_1_raw"].to_numpy()
+    y     = cv_oos["y_true"].to_numpy()
+
+    proba_calib = np.full(len(cv_oos), np.nan)
+    kf = KFold(n_splits=n_splits, shuffle=False)
+    for tr_idx, te_idx in kf.split(cv_oos):
+        iso_fold = IsotonicRegression(out_of_bounds="clip")
+        iso_fold.fit(p_raw[tr_idx], y[tr_idx])
+        proba_calib[te_idx] = iso_fold.transform(p_raw[te_idx])
+    cv_oos["proba_1"] = proba_calib
+    cv_oos["proba_long"] = proba_calib
+
+    # Final calibrator on ALL cv_oos rows — legit since test is fully held out
+    primary_calibrator = IsotonicRegression(out_of_bounds="clip")
+    primary_calibrator.fit(p_raw, y)
+    return primary_calibrator, cv_oos
+
+
+def train_one_primary(cfg: dict, output_dir: Path, log: logging.Logger) -> dict:
+    """Train one primary RF, calibrate, save bundle pkl. Returns summary dict."""
+    t_start = time.perf_counter()
+    pick_id   = cfg["pick_id"]
+    bar_size  = cfg["bar_size"]
+    pt_sl     = cfg["pt_sl"]
+    pt, sl    = cfg["pt"], cfg["sl"]
+    span      = cfg["span"]
+    cusum_h   = cfg["cusum_h"]
+    max_hold  = cfg["max_hold"]
+
+    log.info(f"  bar={bar_size} pt_sl={pt_sl} span={span} cusum={cusum_h} hold={max_hold}"
+             f" depth={cfg['max_depth']} leaf={cfg['min_samples_leaf']}")
+
+    # 1. Load bars (FULL — test will be split chronologically)
+    bars_path = Path(f"data/processed/dollar_bars_{bar_size}_{SYMBOL}.parquet")
+    if not bars_path.exists():
+        raise FileNotFoundError(f"Missing bars: {bars_path}")
+    bars = pd.read_parquet(bars_path)
+    log.info(f"  bars loaded: {len(bars):,}")
+
+    # 2. Generate or load labels
+    LABELS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path = labels_cache_path(SYMBOL, bar_size, span, pt, sl, max_hold)
+    if cache_path.exists():
+        labels_full = pd.read_parquet(cache_path)
+        log.info(f"  labels cache hit → {cache_path.name}")
+    else:
+        log.info(f"  generating labels (cache miss) → {cache_path.name}")
+        close_ts = pd.Series(bars["close"].values, index=pd.DatetimeIndex(bars["close_time"]))
+        vol_full = getDailyVol(close_ts, span=span)
+        vol_full = vol_full[~vol_full.index.duplicated(keep="last")]
+        vol_aligned = vol_full.reindex(pd.DatetimeIndex(bars["close_time"])).ffill()
+        _buf = io.StringIO()
+        with contextlib.redirect_stdout(_buf):
+            labels_full = label_bars(bars, vol_aligned, pt=pt, sl=sl, max_hold=max_hold)
+        labels_full.to_parquet(cache_path, index=False)
+        log.info(f"  labels generated: {len(labels_full):,}")
+
+    # 3. V2 lagged features
+    features_full = compute_lagged_bar_features(bars)
+
+    # 4. CUSUM filter
+    close_ts = pd.Series(bars["close"].values, index=pd.DatetimeIndex(bars["close_time"]))
+    event_times = cusum_filter(close_ts, h=cusum_h)
+    labelable = len(labels_full)
+    bars_lab = bars.iloc[:labelable].reset_index(drop=True)
+    feats_lab = features_full.iloc[:labelable].reset_index(drop=True)
+    cusum_mask = bars_lab["close_time"].isin(event_times).values
+    df = feats_lab[cusum_mask].reset_index(drop=True).copy()
+    lab_df = labels_full[cusum_mask].reset_index(drop=True)
+    df["t1_time"] = lab_df["t1_time"].values
+    df["t1"]      = df["t1_time"]
+    df["ret"]     = lab_df["return"].values
+
+    # 5. Binary label (drop timeout=0, keep +1=long, -1=short → 0)
+    df["label_raw"] = lab_df["label"].values
+    df = df[df["label_raw"] != 0].copy()
+    df["label"] = (df["label_raw"] == 1).astype(int)
+    df.drop(columns=["label_raw"], inplace=True)
+    df = df.dropna(subset=list(FEATURES_6_INDICATORS)).reset_index(drop=True)
+    log.info(f"  CUSUM+binary df: {len(df):,} rows  dist={df['label'].value_counts().to_dict()}")
+
+    # 6. Chronological train/test split with max_hold embargo
+    cutoff_idx        = int(len(bars) * (1.0 - TEST_RATIO))
+    cutoff_ts         = pd.Timestamp(bars["close_time"].iloc[cutoff_idx])
+    trainval_end_idx  = cutoff_idx - max_hold
+    cutoff_trim_ts    = pd.Timestamp(bars["close_time"].iloc[trainval_end_idx])
+    df_trainval = df[df["close_time"] < cutoff_trim_ts].reset_index(drop=True)
+    df_test     = df[df["close_time"] >= cutoff_ts].reset_index(drop=True)
+    log.info(f"  trainval: {len(df_trainval):,}  test: {len(df_test):,}")
+
+    # 7. 5-fold Purged CV (raw proba — no calibration here; meta.py handles it)
+    rf_params = {
+        **RF_PARAMS_FIXED,
+        "max_depth":        cfg["max_depth"],
+        "min_samples_leaf": cfg["min_samples_leaf"],
+        "n_jobs":           -1,
+    }
+    _, cv_oos, _ = run_cv(
+        df_trainval,
+        max_hold=max_hold,
+        rf_params=rf_params,
+        feature_cols=list(FEATURES_6_INDICATORS),
+        time_decay_c=1.0,
+        use_time_decay=False,
+        use_overlap=False,
+    )
+    log.info(f"  CV done: cv_oos={len(cv_oos):,} rows  (RAW probas, no calibration)")
+
+    # 8. Final model on full trainval (RAW RF — no CalibratedClassifierCV wrap)
+    X_train = df_trainval[list(FEATURES_6_INDICATORS)].to_numpy(dtype=float)
+    y_train = df_trainval["label"].to_numpy()
+    final_model = RandomForestClassifier(**rf_params).fit(X_train, y_train)
+    long_col = int(np.where(final_model.classes_ == 1)[0][0])
+
+    # 9. Test predictions — RAW (calibration will be applied downstream in meta.py)
+    X_test = df_test[list(FEATURES_6_INDICATORS)].to_numpy(dtype=float)
+    y_test = df_test["label"].to_numpy()
+    test_proba_raw = final_model.predict_proba(X_test)[:, long_col]
+
+    raw_std = float(cv_oos["proba_1"].std()) if "proba_1" in cv_oos.columns else float("nan")
+    log.info(f"  raw cv_oos proba std: {raw_std:.4f}")
+
+    # 10. Save bundle (RAW model + raw probas — meta.py will calibrate)
+    bundle = {
+        "config":          cfg,
+        "final_model":     final_model,       # raw RF, no calibration wrap
+        "cv_oos":          cv_oos,            # raw proba_1, y_true, ret, close_time, log_return
+        "df_trainval":     df_trainval[["close_time", "t1_time", "ret", "label"]].reset_index(drop=True),
+        "df_test":         df_test[["close_time", "t1_time", "ret", "label"]].reset_index(drop=True),
+        "X_test":          X_test,
+        "y_test":          y_test,
+        "test_proba_raw":  test_proba_raw,    # raw predict_proba — meta.py calibrates
+        "long_col":        long_col,
+        "feature_names":   list(FEATURES_6_INDICATORS),
+        "rf_params":       rf_params,
+        "split_meta": {
+            "cutoff_ts":       str(cutoff_ts),
+            "cutoff_trim_ts":  str(cutoff_trim_ts),
+            "test_ratio":      TEST_RATIO,
+            "n_trainval":      len(df_trainval),
+            "n_test":          len(df_test),
+        },
+        "metadata": {
+            "v2_lagged":     True,
+            "calibrated":    False,           # explicit: meta.py is responsible
+            "train_date":    datetime.now().isoformat(),
+            "pick_id":       pick_id,
+            "trial_number":  cfg.get("trial_number"),
+            "study_name":    cfg.get("study_name"),
+            "group_tag":     cfg.get("group_tag"),
+            "category":      cfg.get("category"),
+        },
+    }
+    out_path = output_dir / f"primary_{pick_id:02d}_t{cfg.get('trial_number','x')}.pkl"
+    joblib.dump(bundle, out_path, compress=3)
+    elapsed = time.perf_counter() - t_start
+    log.info(f"  saved → {out_path.name}  [{elapsed:.1f}s]")
+
+    return {
+        "pick_id":       pick_id,
+        "trial_number":  cfg.get("trial_number"),
+        "group_tag":     cfg.get("group_tag"),
+        "path":          str(out_path),
+        "n_trainval":    len(df_trainval),
+        "n_test":        len(df_test),
+        "raw_proba_std": raw_std,
+        "elapsed_s":     elapsed,
+        "status":        "OK",
+    }
+
+
+def train_batch(configs_path: Path, output_dir: Path) -> None:
+    """Train all primaries listed in configs_path, save pkl bundles to output_dir."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log, _, _ = setup_logging(run_name=f"train_batch_{datetime.now():%Y%m%d_%H%M%S}")
+
+    with open(configs_path) as f:
+        configs = json.load(f)["configs"]
+
+    log.info(f"\n=== TRAIN BATCH — {len(configs)} primary models ===")
+    log.info(f"  output_dir: {output_dir}")
+    log.info(f"  V2 lagged features (shift(1) applied to all indicator cols)")
+
+    results = []
+    for i, cfg in enumerate(configs, 1):
+        log.info(f"\n[{i}/{len(configs)}] Primary #{cfg['pick_id']:02d}"
+                 f" (trial t{cfg.get('trial_number')}, {cfg.get('group_tag')})")
+        try:
+            r = train_one_primary(cfg, output_dir, log)
+            results.append(r)
+        except Exception as e:
+            log.exception(f"  FAILED: {e}")
+            results.append({
+                "pick_id":       cfg["pick_id"],
+                "trial_number":  cfg.get("trial_number"),
+                "status":        "FAILED",
+                "error":         str(e),
+            })
+
+    summary_path = output_dir / "summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(results, f, indent=2)
+    log.info(f"\n=== DONE — summary → {summary_path} ===")
+    ok = sum(1 for r in results if r.get("status") == "OK")
+    log.info(f"  Success: {ok}/{len(results)}")
 
 
 # ── Optuna TPE Search ──────────────────────────────────────────────────────────
@@ -1010,10 +1240,19 @@ def optuna_main(
 
 
 if __name__ == "__main__":
-    optuna_main(
-        n_trials=N_TRIALS,
-        study_name=STUDY_NAME,
-        optuna_n_jobs=RUN_OPTUNA_N_JOBS,
-        rf_n_jobs=RUN_RF_N_JOBS,
-        storage=RUN_STORAGE,
+    # ── HARD-CODED: train 15 primaries from primary_configs.json ──
+    # Set PILOT=True to train only the first primary (validation run).
+    # Set PILOT=False to train all 15.
+    # To restore Optuna study, comment train_batch and uncomment optuna_main.
+    PROJECT_ROOT = Path(__file__).resolve().parent.parent
+    train_batch(
+        configs_path=PROJECT_ROOT / "primary_configs.json",
+        output_dir=PROJECT_ROOT / "models" / "primary"
     )
+    # optuna_main(
+    #     n_trials=N_TRIALS,
+    #     study_name=STUDY_NAME,
+    #     optuna_n_jobs=RUN_OPTUNA_N_JOBS,
+    #     rf_n_jobs=RUN_RF_N_JOBS,
+    #     storage=RUN_STORAGE,
+    # )

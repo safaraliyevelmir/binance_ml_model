@@ -15,3 +15,16 @@ mlruns/
 *.md
 *.ipynb
 .DS_Store
+*.db
+*.csv
+*.pkl
+*.png
+*.pdf
+*.json
+*.parquet
+
+# Whitelist primary model bundles — needed for meta study reproducibility
+!models/primary/*.pkl
+# Also whitelist the primary configs + summary for reproducibility
+!primary_configs.json
+!models/primary/summary.json

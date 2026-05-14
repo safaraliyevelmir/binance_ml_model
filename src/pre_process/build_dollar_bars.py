@@ -1,15 +1,14 @@
 # pip install numba
 import glob
-import os
 
 import numba
 import numpy as np
 import pandas as pd
 
 SYMBOL = "SOLUSDT"
-THRESHOLD = 25_000_000  # $25M per bar
+THRESHOLD = 60_000_000  # $25M per bar
 RAW_DIR = "data/raw"
-OUT_PATH = f"data/processed/dollar_bars_25_{SYMBOL}.parquet"
+OUT_PATH = f"data/processed/dollar_bars_60_{SYMBOL}.parquet"
 
 
 @numba.njit(cache=True)
@@ -113,7 +112,7 @@ def build_dollar_bars_streaming(files: list[str], threshold: float) -> pd.DataFr
     all_frames = []
 
     for f in files:
-        df = pd.read_parquet(f).sort_values("timestamp")
+        df = pd.read_parquet(f, engine="pyarrow").sort_values("timestamp")
         result = process_chunk_nb(
             df["price"].to_numpy(dtype=np.float64),
             df["quantity"].to_numpy(dtype=np.float64),

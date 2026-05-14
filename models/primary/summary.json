@@ -1,0 +1,167 @@
+[
+  {
+    "pick_id": 1,
+    "trial_number": 591,
+    "group_tag": "short_bar15",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_01_t591.pkl",
+    "n_trainval": 73702,
+    "n_test": 9155,
+    "raw_proba_std": 0.015324484977973665,
+    "elapsed_s": 19.472658124985173,
+    "status": "OK"
+  },
+  {
+    "pick_id": 2,
+    "trial_number": 2115,
+    "group_tag": "small_bar3",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_02_t2115.pkl",
+    "n_trainval": 235919,
+    "n_test": 24632,
+    "raw_proba_std": 0.014322651152080616,
+    "elapsed_s": 54.484536958974786,
+    "status": "OK"
+  },
+  {
+    "pick_id": 3,
+    "trial_number": 1044,
+    "group_tag": "small_bar3",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_03_t1044.pkl",
+    "n_trainval": 235727,
+    "n_test": 24467,
+    "raw_proba_std": 0.019995174766490362,
+    "elapsed_s": 76.66459549998399,
+    "status": "OK"
+  },
+  {
+    "pick_id": 4,
+    "trial_number": 551,
+    "group_tag": "small_bar5",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_04_t551.pkl",
+    "n_trainval": 184898,
+    "n_test": 20918,
+    "raw_proba_std": 0.023077929884302968,
+    "elapsed_s": 160.8107040420291,
+    "status": "OK"
+  },
+  {
+    "pick_id": 5,
+    "trial_number": 1521,
+    "group_tag": "small_bar5",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_05_t1521.pkl",
+    "n_trainval": 185079,
+    "n_test": 21065,
+    "raw_proba_std": 0.01910172762037061,
+    "elapsed_s": 131.58977929101093,
+    "status": "OK"
+  },
+  {
+    "pick_id": 6,
+    "trial_number": 1523,
+    "group_tag": "symmetric",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_06_t1523.pkl",
+    "n_trainval": 88455,
+    "n_test": 11962,
+    "raw_proba_std": 0.0275054298399737,
+    "elapsed_s": 58.450144541973714,
+    "status": "OK"
+  },
+  {
+    "pick_id": 7,
+    "trial_number": 2399,
+    "group_tag": "symmetric",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_07_t2399.pkl",
+    "n_trainval": 88402,
+    "n_test": 11921,
+    "raw_proba_std": 0.0256993947603942,
+    "elapsed_s": 58.586347082979046,
+    "status": "OK"
+  },
+  {
+    "pick_id": 8,
+    "trial_number": 930,
+    "group_tag": "symmetric",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_08_t930.pkl",
+    "n_trainval": 54180,
+    "n_test": 7461,
+    "raw_proba_std": 0.04282946618172194,
+    "elapsed_s": 62.954305582970846,
+    "status": "OK"
+  },
+  {
+    "pick_id": 9,
+    "trial_number": 1623,
+    "group_tag": "symmetric",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_09_t1623.pkl",
+    "n_trainval": 54159,
+    "n_test": 7446,
+    "raw_proba_std": 0.030547592225210363,
+    "elapsed_s": 57.43887570902007,
+    "status": "OK"
+  },
+  {
+    "pick_id": 10,
+    "trial_number": 2169,
+    "group_tag": "symmetric",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_10_t2169.pkl",
+    "n_trainval": 88351,
+    "n_test": 11871,
+    "raw_proba_std": 0.034913387096862376,
+    "elapsed_s": 66.58065737498691,
+    "status": "OK"
+  },
+  {
+    "pick_id": 11,
+    "trial_number": 220,
+    "group_tag": "long_biased",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_11_t220.pkl",
+    "n_trainval": 62115,
+    "n_test": 7131,
+    "raw_proba_std": 0.033554162847830735,
+    "elapsed_s": 68.69084354199003,
+    "status": "OK"
+  },
+  {
+    "pick_id": 12,
+    "trial_number": 1057,
+    "group_tag": "long_biased",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_12_t1057.pkl",
+    "n_trainval": 62076,
+    "n_test": 7108,
+    "raw_proba_std": 0.034645281431227484,
+    "elapsed_s": 84.20450925000478,
+    "status": "OK"
+  },
+  {
+    "pick_id": 13,
+    "trial_number": 1305,
+    "group_tag": "long_biased",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_13_t1305.pkl",
+    "n_trainval": 62094,
+    "n_test": 7130,
+    "raw_proba_std": 0.037342139300647434,
+    "elapsed_s": 84.35150820901617,
+    "status": "OK"
+  },
+  {
+    "pick_id": 14,
+    "trial_number": 2393,
+    "group_tag": "long_biased",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_14_t2393.pkl",
+    "n_trainval": 62144,
+    "n_test": 7152,
+    "raw_proba_std": 0.03329178071764723,
+    "elapsed_s": 17.832859458052553,
+    "status": "OK"
+  },
+  {
+    "pick_id": 15,
+    "trial_number": 615,
+    "group_tag": "long_biased",
+    "path": "/Users/safaraliyevelmir/Desktop/binance_ml_model/models/primary/primary_15_t615.pkl",
+    "n_trainval": 54189,
+    "n_test": 7461,
+    "raw_proba_std": 0.046333123324768,
+    "elapsed_s": 61.299873082956765,
+    "status": "OK"
+  }
+]

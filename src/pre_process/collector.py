@@ -58,7 +58,7 @@ async def download_binance_agg_trades(session: aiohttp.ClientSession, symbol: st
     out_path = f"data/raw/{symbol}_{year}_{month:02d}.parquet"
     if os.path.exists(out_path):
         print(f"Already exists, skipping: {year}-{month:02d}")
-        return pd.read_parquet(out_path)
+        return
 
     url = (
         f"https://data.binance.vision/data/futures/um/monthly/aggTrades/"
@@ -106,7 +106,7 @@ async def download_binance_agg_trades(session: aiohttp.ClientSession, symbol: st
     df.to_parquet(out_path)
     os.remove(tmp_path)
     print(f"Saved {year}-{month:02d}: {len(df):,} trades, {df['dollar_volume'].sum()/1e9:.1f}B USDT")
-    return df
+    del df  # free memory
 
 
 async def main():
